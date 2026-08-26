@@ -1,0 +1,75 @@
+# Brings up everything EXCEPT TrueForge itself in one command:
+#   docker compose up --build
+#
+# TrueForge stays outside this file on purpose -- run it the way its own
+# docs describe (`npx @truefoundry/trueforge@latest`, or its own Docker
+# Compose) directly on your host. That keeps this repo decoupled from
+# TrueForge's own release process, and keeps networking simple: every
+# service below is reachable from your host via localhost on its published
+# port, and the backend reaches TrueForge on your host via
+# host.docker.internal.
+#
+# First run: copy .env.example to .env and fill in TRUEFORGE_AGENT_NAME /
+# TRUEFORGE_MODEL etc. if you want non-default values -- everything has a
+# sane default otherwise.
+
+services:
+  demo-app:
+    build: ./demo-app
+    ports:
+      - "8081:8081"
+    environment:
+      DEMO_APP_PORT: "8081"
+
+  mcp-server:
+    build: ./mcp-server
+    ports:
+      - "8082:8082"
+    environment:
+      MCP_SERVER_PORT: "8082"
+      DEMO_APP_URL: "http://demo-app:8081"
+    depends_on:
+      - demo-app
+
+  backend:
+    build: ./backend
+    ports:
+      - "8083:8083"
+    environment:
+      BACKEND_PORT: "8083"
+      DEMO_APP_URL: "http://demo-app:8081"
+      # TrueForge itself runs on your HOST (not in this compose file), so
+      # the backend container reaches it via host.docker.internal.
+      TRUEFORGE_BASE_URL: "${TRUEFORGE_BASE_URL:-http://host.docker.internal:8790}"
+      TRUEFORGE_API_KEY: "${TRUEFORGE_API_KEY:-}"
+      TRUEFORGE_AGENT_NAME: "${TRUEFORGE_AGENT_NAME:-incident-responder}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # needed on Linux; no-op on Docker Desktop
+    depends_on:
+      - demo-app
+
+  watcher:
+    build: ./telemetry
+    environment:
+      DEMO_APP_URL: "http://demo-app:8081"
+      BACKEND_URL: "http://backend:8083"
+      ERROR_RATE_THRESHOLD: "${ERROR_RATE_THRESHOLD:-85}"
+    depends_on:
+      - demo-app
+      - backend
+
+  dashboard:
+    build: ./dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      BACKEND_URL: "http://backend:8083"
+      DEMO_APP_URL: "http://demo-app:8081"
+      # These two are only used for on-screen labels/links a human clicks
+      # from their OWN browser on the host, so -- unlike the backend above
+      # -- they stay as host-facing localhost URLs, not host.docker.internal.
+      TRUEFORGE_BASE_URL: "http://localhost:8790"
+      MCP_SERVER_URL: "http://localhost:8082/mcp"
+    depends_on:
+      - demo-app
+      - backend

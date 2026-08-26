@@ -1,0 +1,3 @@
+streamlit>=1.38
+httpx>=0.27
+pandas>=2.2
