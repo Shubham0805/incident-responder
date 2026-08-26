@@ -21,8 +21,30 @@ minute.
 import json
 import os
 import sys
+from pathlib import Path
 
 import httpx
+
+
+def _load_dotenv(path: Path = Path(__file__).resolve().parent.parent / ".env") -> None:
+    """Load KEY=VALUE lines from .env into os.environ, without adding a
+    python-dotenv dependency. Real exported env vars always win -- this only
+    fills in values that aren't already set, so `.env` acts as a default,
+    not an override. (Flagged by Qodo: this script used to silently ignore
+    .env entirely and only pick up already-exported shell vars.)"""
+    if not path.exists():
+        return
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+_load_dotenv()
 
 BASE_URL = os.environ.get("TRUEFORGE_BASE_URL", "http://localhost:8790").rstrip("/")
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8082/mcp")
