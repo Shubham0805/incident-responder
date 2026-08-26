@@ -55,10 +55,18 @@ MODEL_NAME = os.environ.get("TRUEFORGE_MODEL", "openai/gpt-4o")
 
 GITHUB_REPO = os.environ.get("GITHUB_REPO_URL", "https://github.com/<you>/<repo>")
 
+# Only needed when TrueForge is running in hosted/Docker mode with auth
+# enabled -- the default local `npx` instance doesn't require this. (Flagged
+# by Qodo: .env.example documents TRUEFORGE_API_KEY but this script never
+# read it or attached it to requests, so registration would 401 against an
+# authenticated instance.)
+API_KEY = os.environ.get("TRUEFORGE_API_KEY", "").strip()
+AUTH_HEADERS = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+
 
 def _post(path: str, body: dict) -> tuple[int, dict]:
     try:
-        resp = httpx.post(f"{BASE_URL}{path}", json=body, timeout=15)
+        resp = httpx.post(f"{BASE_URL}{path}", json=body, headers=AUTH_HEADERS, timeout=15)
         try:
             data = resp.json()
         except Exception:
