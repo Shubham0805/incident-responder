@@ -1,0 +1,43 @@
+# Automated PR code review, satisfying the hackathon's Qodo requirement.
+#
+# RECOMMENDED PATH: install the "Qodo Merge" GitHub App from the GitHub
+# Marketplace on this repo (Settings -> your repo -> the app's install page,
+# 14-day free trial, no card). Once installed it reviews every PR
+# automatically -- no workflow file needed, and you can DELETE this file.
+#
+# FALLBACK: this workflow runs the open-source PR-Agent action (the engine
+# Qodo Merge itself is built on) directly in CI, if you'd rather not install
+# the GitHub App or want reviews to also show up as Action runs. It needs
+# two repo secrets: OPENAI_KEY (or another supported model provider key) and
+# the default GITHUB_TOKEN (already provided by Actions).
+#
+# Verify the action reference below is still current on the GitHub
+# Marketplace before relying on it for submission -- this project's
+# ecosystem had an open-source/Qodo-branded split shortly before this repo
+# was written (Aug 2026).
+name: PR code review (PR-Agent / Qodo)
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    if: github.event.pull_request || (github.event.issue.pull_request && contains(github.event.comment.body, '/'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: PR-Agent review
+        uses: the-pr-agent/pr-agent@main
+        env:
+          OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          github_action_config.auto_review: "true"
+          github_action_config.auto_describe: "true"
+          github_action_config.auto_improve: "true"
