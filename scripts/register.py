@@ -21,8 +21,30 @@ minute.
 import json
 import os
 import sys
+from pathlib import Path
 
 import httpx
+
+
+def _load_dotenv(path: Path = Path(__file__).resolve().parent.parent / ".env") -> None:
+    """Load KEY=VALUE lines from .env into os.environ, without adding a
+    python-dotenv dependency. Real exported env vars always win -- this only
+    fills in values that aren't already set, so `.env` acts as a default,
+    not an override. (Flagged by Qodo: this script used to silently ignore
+    .env entirely and only pick up already-exported shell vars.)"""
+    if not path.exists():
+        return
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+_load_dotenv()
 
 BASE_URL = os.environ.get("TRUEFORGE_BASE_URL", "http://localhost:8790").rstrip("/")
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8082/mcp")
@@ -33,10 +55,18 @@ MODEL_NAME = os.environ.get("TRUEFORGE_MODEL", "openai/gpt-4o")
 
 GITHUB_REPO = os.environ.get("GITHUB_REPO_URL", "https://github.com/<you>/<repo>")
 
+# Only needed when TrueForge is running in hosted/Docker mode with auth
+# enabled -- the default local `npx` instance doesn't require this. (Flagged
+# by Qodo: .env.example documents TRUEFORGE_API_KEY but this script never
+# read it or attached it to requests, so registration would 401 against an
+# authenticated instance.)
+API_KEY = os.environ.get("TRUEFORGE_API_KEY", "").strip()
+AUTH_HEADERS = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+
 
 def _post(path: str, body: dict) -> tuple[int, dict]:
     try:
-        resp = httpx.post(f"{BASE_URL}{path}", json=body, timeout=15)
+        resp = httpx.post(f"{BASE_URL}{path}", json=body, headers=AUTH_HEADERS, timeout=15)
         try:
             data = resp.json()
         except Exception:

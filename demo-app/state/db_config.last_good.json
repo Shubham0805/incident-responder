@@ -1,4 +1,0 @@
-{
-  "dsn": "postgresql://app:S3cure-Pass@db-primary.internal:5432/app_prod?pool=20",
-  "pool_size": 20
-}
