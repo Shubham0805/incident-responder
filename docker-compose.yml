@@ -39,12 +39,30 @@ services:
       BACKEND_PORT: "8083"
       DEMO_APP_URL: "http://demo-app:8081"
       # TrueForge itself runs on your HOST (not in this compose file), so
-      # the backend container reaches it via host.docker.internal.
-      TRUEFORGE_BASE_URL: "${TRUEFORGE_BASE_URL:-http://host.docker.internal:8790}"
+      # the backend container reaches it via host.docker.internal -- this is
+      # intentionally a DIFFERENT env var than TRUEFORGE_BASE_URL (which
+      # scripts/register.py uses on the host, and should stay "localhost").
+      # Reusing the same var here was a bug: setting TRUEFORGE_BASE_URL in
+      # .env for register.py's sake silently broke the backend container,
+      # since "localhost" inside a container means the container itself.
+      # See backend/trueforge_client.py for why this is a placeholder host,
+      # not a real hostname -- resolved to the Docker bridge gateway IP at
+      # runtime, verified live against Docker Desktop for Mac. Pairs with
+      # scripts/host_proxy.py, which must be running on your host.
+      TRUEFORGE_BASE_URL: "${TRUEFORGE_DOCKER_URL:-http://__DOCKER_GATEWAY__:18790}"
       TRUEFORGE_API_KEY: "${TRUEFORGE_API_KEY:-}"
       TRUEFORGE_AGENT_NAME: "${TRUEFORGE_AGENT_NAME:-incident-responder}"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"  # needed on Linux; no-op on Docker Desktop
+    # No `extra_hosts: host.docker.internal:host-gateway` here on purpose.
+    # Docker Desktop (Mac/Windows) already resolves host.docker.internal
+    # natively (IPv4, working) -- adding that extra_hosts entry ourselves
+    # was verified live to override it with an IPv6 host-gateway address
+    # (fdc4:...) that the container can't route, producing
+    # "ConnectError: [Errno 101] Network is unreachable" even though
+    # TrueForge was up and reachable the whole time. If you're on plain
+    # Docker Engine on Linux (no Docker Desktop) and host.docker.internal
+    # doesn't resolve for you at all, add it back:
+    #   extra_hosts:
+    #     - "host.docker.internal:host-gateway"
     depends_on:
       - demo-app
 

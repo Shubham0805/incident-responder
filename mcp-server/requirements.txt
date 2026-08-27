@@ -1,2 +1,8 @@
-mcp>=1.27
+# Pinned to the 1.x line on purpose -- found live, running the real stack,
+# that `mcp` 2.x renamed FastMCP to MCPServer and changed the import paths
+# (mcp.server.fastmcp -> mcp.server.mcpserver), which this project's code
+# (sre_tools_server.py) is not written against. `mcp>=1.27` with no upper
+# bound let pip install 2.1.1 and broke this at MCP-server startup with
+# `ModuleNotFoundError: No module named 'mcp.server.fastmcp'`.
+mcp>=1.27,<2
 httpx>=0.27

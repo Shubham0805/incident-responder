@@ -40,6 +40,7 @@ STATUS_COLORS = {
     "remediating": ("#2980b9", "REMEDIATING — rollback approved, agent applying fix"),
     "remediation_denied": ("#7f8c8d", "Rollback DENIED by human"),
     "resolved": ("#27ae60", "HEALTHY — resolved"),
+    "error": ("#8e44ad", "⚠ TURN ENDED WITHOUT REMEDIATION — see error below"),
 }
 
 st.markdown(

@@ -108,21 +108,29 @@ npx @truefoundry/trueforge@latest
 # 2. In TrueForge's UI (localhost:8790): Settings -> Models (add your LLM key)
 #    and Settings -> Sandbox providers (add your Daytona key).
 
-# 3. Everything else -- demo-app, sre-tools MCP server, backend, telemetry
+# 3. `npx trueforge` only binds to loopback (127.0.0.1) -- there's no --host
+#    flag to change that. Docker containers reaching your machine over the
+#    bridge network is a different path than "localhost", so without this
+#    proxy the backend container's connection gets refused even though the
+#    route itself works. Run this in its own terminal too, and leave it running:
+python3 scripts/host_proxy.py
+
+# 4. Everything else -- demo-app, sre-tools MCP server, backend, telemetry
 #    watcher, dashboard -- in one command
 cd incident-responder
 cp .env.example .env   # adjust only if you changed a port above
 docker compose up --build
 
-# 4. In a second terminal, one-time registration against your running
+# 5. In a fourth terminal, one-time registration against your running
 #    TrueForge instance (needs Python + httpx locally -- this one script is
-#    not itself containerized, it just makes two HTTP calls to localhost:8790)
+#    not itself containerized, it just makes HTTP calls to localhost:8790)
 python3 -m pip install httpx --break-system-packages 2>/dev/null || python3 -m pip install httpx
 python3 scripts/register.py
 ```
 
 Open **http://localhost:8501** for the dashboard. `docker compose down` stops
-everything (TrueForge, running separately on your host, is unaffected).
+the containers (TrueForge and `host_proxy.py`, running on your host, are
+unaffected -- stop those with Ctrl+C when you're done).
 
 ### Why isn't TrueForge in the compose file?
 
@@ -131,8 +139,20 @@ harness itself. Nesting a copy of that inside this repo's compose file would
 mean tracking a moving target and getting cross-container networking right
 for infrastructure we don't own. Running TrueForge the way its own docs
 describe (`npx ...` or its own compose) and letting this repo's containers
-reach it over `host.docker.internal` is simpler and won't silently drift out
-of date. Every service in `docker-compose.yml` here is still one command.
+reach it is simpler and won't silently drift out of date. Every service in
+`docker-compose.yml` here is still one command.
+
+### Why does this need a host proxy at all?
+
+Found running the actual stack end-to-end, not assumed: on Docker Desktop
+for Mac, `host.docker.internal` -- the usual way a container reaches its
+host -- resolved to an unroutable IPv6 address, and removing our own
+`extra_hosts` override didn't change that (Docker Desktop's own DNS is the
+source). Separately, `npx trueforge` binds only to loopback, so even a
+working route to your machine gets refused. `scripts/host_proxy.py` and the
+gateway auto-discovery in `backend/trueforge_client.py` route around both
+issues at once, without needing you to hardcode a machine-specific IP
+anywhere.
 
 ### Alternative: run natively (no Docker)
 

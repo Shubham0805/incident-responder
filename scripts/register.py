@@ -1,21 +1,34 @@
 #!/usr/bin/env python3
 """
-One-time setup: register the sre-tools MCP server and the incident-responder
-agent against a locally running TrueForge instance.
+One-time setup: register the sre-tools MCP server, the incident-responder
+agent, and the sre-playbook skill against a locally running TrueForge
+instance.
 
-Run this AFTER `npx @truefoundry/trueforge@latest` and the sre-tools MCP
-server (`python mcp-server/sre_tools_server.py`) are both up.
+Run this AFTER `npx @truefoundry/trueforge@latest` is up and you've added an
+LLM provider key in its Settings -> Models UI, and AFTER `docker compose up`
+(or the native equivalent) has the sre-tools MCP server reachable.
 
-Two pieces of this need a live instance to fully confirm (TrueForge's public
-docs didn't give a verbatim schema for every field -- see comments below):
-  - MCPServerManifest.type's exact enum value
-  - whether MCP servers / skills can be registered by name immediately after
-    creation, or need a moment / a UI confirmation step
+Every request shape below (paths, field names, the MCP server `type` enum,
+the agent model FQN format, the skill manifest fields) was verified against
+a live TrueForge instance's own /api/v1/openapi.json -- not guessed from
+docs. Two things TrueForge's docs don't spell out and that verification
+caught:
+  - MCPServerManifest.type only accepts "remote" (not "streamable-http",
+    despite the transport itself being streamable-http under the hood), and
+    `auth` must be omitted entirely for an unauthenticated server -- there's
+    no `{"type": "none"}` variant.
+  - The agent spec's `model.name` must be the FULL "provider/model" string
+    exactly as returned by GET /api/v1/models (e.g. "openai/gpt-5.2" or
+    "google-gemini/gemini-3-6-flash") -- NOT the bare model name shown in
+    the Settings UI, and NOT the separate `model_id` field on that same
+    response. Sending the wrong one 422s with "provider not configured"
+    rather than a clear "bad format" error, so it's easy to misdiagnose.
+    Run `curl -s http://localhost:8790/api/v1/models | python3 -m json.tool`
+    to see the exact strings for whatever you've configured, and set
+    TRUEFORGE_MODEL to the `name` field (not `model_id`) from there.
 
-If either POST below fails, this script prints the exact JSON payload it
-tried so you can paste it into TrueForge's UI (Settings -> Connectors /
-Settings -> Skills) by hand instead -- that always works and only takes a
-minute.
+If any POST below fails, this script prints the exact JSON payload it tried
+so you can paste it into TrueForge's UI by hand instead -- that always works.
 """
 
 import json
@@ -51,15 +64,24 @@ MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8082/mcp")
 AGENT_NAME = os.environ.get("TRUEFORGE_AGENT_NAME", "incident-responder")
 MCP_SERVER_NAME = os.environ.get("TRUEFORGE_MCP_SERVER_NAME", "sre-tools")
 SKILL_NAME = os.environ.get("TRUEFORGE_SKILL_NAME", "sre-playbook")
-MODEL_NAME = os.environ.get("TRUEFORGE_MODEL", "openai/gpt-4o")
+SKILL_REF = os.environ.get("TRUEFORGE_SKILL_REF", "main")
 
+# Must be the full "provider/model" FQN from GET /api/v1/models's `name`
+# field for whatever you configured in Settings -> Models -- see the module
+# docstring above. There's no universal default that works for every judge's
+# setup, so this intentionally has no fallback -- the script fails loudly
+# instead of silently registering an agent that can never run a turn.
+MODEL_NAME = os.environ.get("TRUEFORGE_MODEL")
+
+# Only needed for the skill registration below -- the skill registry is
+# git-backed, so it needs a real pushed repo, not a local-only folder.
 GITHUB_REPO = os.environ.get("GITHUB_REPO_URL", "https://github.com/<you>/<repo>")
 
 # Only needed when TrueForge is running in hosted/Docker mode with auth
 # enabled -- the default local `npx` instance doesn't require this. (Flagged
-# by Qodo: .env.example documents TRUEFORGE_API_KEY but this script never
-# read it or attached it to requests, so registration would 401 against an
-# authenticated instance.)
+# by Qodo: .env.example documents TRUEFORGE_API_KEY but this script used to
+# never read it or attach it to requests, so registration would 401 against
+# an authenticated instance.)
 API_KEY = os.environ.get("TRUEFORGE_API_KEY", "").strip()
 AUTH_HEADERS = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
 
@@ -78,17 +100,21 @@ def _post(path: str, body: dict) -> tuple[int, dict]:
 
 def register_mcp_server():
     manifest = {
-        "type": "streamable-http",  # VERIFY against your instance if this 400s
+        "type": "remote",
         "name": MCP_SERVER_NAME,
         "url": MCP_SERVER_URL,
         "description": "SRE triage/remediation tools for demo-app (tail_log, "
                         "check_db_health, apply_system_change).",
-        "auth": {"type": "none"},
+        # No `auth` key: omit entirely for an unauthenticated server. There
+        # is no `{"type": "none"}` variant in TrueForge's MCPServerManifest.
     }
     print(f"-> registering MCP server '{MCP_SERVER_NAME}' at {MCP_SERVER_URL}")
-    status, data = _post("/api/v1/mcp-servers", {"manifest": manifest})
+    status, data = _post("/api/v1/settings/mcp-servers", {"manifest": manifest})
     if status and 200 <= status < 300:
         print(f"   OK ({status})")
+    elif status == 409 or "already exists" in str(data.get("error", "")).lower():
+        print(f"   already registered -- fine, reusing it. Update it via "
+              f"PUT /api/v1/settings/mcp-servers or the UI if you changed the URL/tools.")
     else:
         print(f"   FAILED ({status}): {data}")
         print("   Fall back to the UI: Settings -> Connectors -> Add server, using:")
@@ -96,6 +122,15 @@ def register_mcp_server():
 
 
 def register_agent():
+    if not MODEL_NAME:
+        print("-> SKIPPING agent registration: TRUEFORGE_MODEL is not set.")
+        print("   Run this first to see the exact string TrueForge expects for your")
+        print("   configured provider (use the `name` field, not `model_id`):")
+        print(f"     curl -s {BASE_URL}/api/v1/models | python3 -m json.tool")
+        print("   Then set TRUEFORGE_MODEL in .env (e.g. google-gemini/gemini-3-6-flash)")
+        print("   and re-run this script.")
+        return
+
     spec = {
         "model": {"name": MODEL_NAME},
         "instructions": (
@@ -131,24 +166,47 @@ def register_agent():
         print("   " + json.dumps(spec, indent=2).replace("\n", "\n   "))
 
 
-def print_skill_instructions():
-    print(f"""
--> register the skill (no public REST endpoint documented for this -- do it
-   once via the UI):
-   Settings -> Skills -> Add skill
-     name: {SKILL_NAME}
-     repo: {GITHUB_REPO}
-     path: skills/{SKILL_NAME}
-     ref:  main   (or a tagged commit once you've pushed)
-   (Push this repo to GitHub first if you haven't -- the skill registry is
-   git-backed, it can't read a local-only folder.)
-""")
+def register_skill():
+    if "<you>/<repo>" in GITHUB_REPO:
+        print("-> SKIPPING skill registration: GITHUB_REPO_URL is not set (still the")
+        print("   placeholder). The skill registry is git-backed, so it needs a real")
+        print("   pushed repo. Set GITHUB_REPO_URL in .env, e.g.:")
+        print("     GITHUB_REPO_URL=https://github.com/<you>/incident-responder")
+        print("   and re-run this script -- or add it by hand in Settings -> Skills:")
+        print(f"     name: {SKILL_NAME}  path: skills/{SKILL_NAME}  ref: {SKILL_REF}")
+        return
+
+    manifest = {
+        "type": "git",
+        "name": SKILL_NAME,
+        "url": GITHUB_REPO,
+        "path": f"skills/{SKILL_NAME}",
+        "ref": SKILL_REF,
+        "description": "SRE operational playbook: triage -> sandbox diagnostic -> "
+                        "gated rollback -> verify -> incident report.",
+    }
+    print(f"-> registering skill '{SKILL_NAME}' from {GITHUB_REPO} :: skills/{SKILL_NAME} @ {SKILL_REF}")
+    status, data = _post("/api/v1/settings/skills", {"manifest": manifest})
+    if status and 200 <= status < 300:
+        print(f"   OK ({status})")
+    elif status == 409 or "already exists" in str(data.get("error", "")).lower():
+        print(f"   already registered -- fine, reusing it. Update it via the UI "
+              f"(Settings -> Skills) if you changed the path/ref.")
+    else:
+        print(f"   FAILED ({status}): {data}")
+        print("   Fall back to the UI: Settings -> Skills -> Add skill, using:")
+        print("   " + json.dumps(manifest, indent=2).replace("\n", "\n   "))
 
 
 if __name__ == "__main__":
     print(f"TrueForge at {BASE_URL} -- make sure it's already running.\n")
     register_mcp_server()
     print()
+    # Skill must be registered BEFORE the agent -- the agent spec references
+    # it by name (`skills: [{"name": SKILL_NAME}]`), and TrueForge 422s with
+    # "Unknown skill ... not configured" if it doesn't exist yet. (Caught by
+    # a live run: the original ordering here registered the agent first.)
+    register_skill()
+    print()
     register_agent()
-    print_skill_instructions()
-    print("Done. Then: ./scripts/run_all.sh")
+    print("\nDone. Then: ./scripts/run_all.sh (or docker compose up, if not already running)")
