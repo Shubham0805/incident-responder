@@ -205,7 +205,7 @@ with right:
         )
 
     st.subheader("Filesystem / logs")
-    st.caption("Agent reads `demo-app/app.log` via `tail_log` — shown live below.")
+    st.caption("Agent tails demo-app's log via `tail_log` -> GET /internal/log (HTTP, not a shared filesystem) — shown live below.")
     tail = _get(f"{DEMO_APP_URL}/metrics")
     with st.expander("Show demo-app metrics JSON"):
         st.json(metrics)
