@@ -98,6 +98,61 @@ def _post(path: str, body: dict) -> tuple[int, dict]:
         return -1, {"error": str(exc)}
 
 
+def _put(path: str, body: dict) -> tuple[int, dict]:
+    try:
+        resp = httpx.put(f"{BASE_URL}{path}", json=body, headers=AUTH_HEADERS, timeout=15)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw": resp.text}
+        return resp.status_code, data
+    except httpx.HTTPError as exc:
+        return -1, {"error": str(exc)}
+
+
+def _upsert(kind: str, collection_path: str, name: str, body: dict, manifest: dict) -> bool:
+    """POST to create; if it already exists (409), don't just assume the
+    registered copy still matches -- PUT the current manifest to the item
+    URL to bring it in line, since a rerun after editing a manifest (a new
+    MCP url, skill ref, or model) is exactly when staleness matters most.
+    TrueForge's item-level update route isn't documented, so this is
+    best-effort: if PUT isn't supported here (404/405) or it fails, this
+    still returns True (the resource does exist, so downstream steps that
+    reference it by name are safe) but says plainly that it could NOT
+    confirm the manifest is current, instead of implying it is. (Flagged by
+    Qodo: every 409 path used to print success and reuse the existing
+    resource unconditionally, silently ignoring any manifest changes.)"""
+    print(f"-> registering {kind} '{name}'")
+    status, data = _post(collection_path, body)
+    if status and 200 <= status < 300:
+        print(f"   OK ({status})")
+        return True
+    if not (status == 409 or "already exists" in str(data.get("error", "")).lower()):
+        print(f"   FAILED ({status}): {data}")
+        print("   Fall back to the UI, using:")
+        print("   " + json.dumps(manifest, indent=2).replace("\n", "\n   "))
+        return False
+
+    item_url = f"{collection_path}/{name}"
+    put_status, put_data = _put(item_url, body)
+    if put_status and 200 <= put_status < 300:
+        print(f"   already existed -- updated to match the current manifest ({put_status})")
+        return True
+    elif put_status in (404, 405):
+        print(f"   already exists -- this TrueForge instance doesn't expose "
+              f"PUT {item_url}, so this script could NOT confirm the "
+              f"registered {kind} matches the manifest below. If you changed "
+              f"anything (URL, ref, model, ...), update it by hand:")
+        print("   " + json.dumps(manifest, indent=2).replace("\n", "\n   "))
+        return True
+    else:
+        print(f"   already exists, and updating it FAILED ({put_status}): {put_data}")
+        print(f"   The registered {kind} may be out of sync with the manifest "
+              f"below -- update it by hand if this matters for your run:")
+        print("   " + json.dumps(manifest, indent=2).replace("\n", "\n   "))
+        return True
+
+
 def register_mcp_server() -> bool:
     """Returns True if the MCP server exists on TrueForge by the time this
     returns (freshly created OR already there from a prior run), False if
@@ -112,20 +167,8 @@ def register_mcp_server() -> bool:
         # No `auth` key: omit entirely for an unauthenticated server. There
         # is no `{"type": "none"}` variant in TrueForge's MCPServerManifest.
     }
-    print(f"-> registering MCP server '{MCP_SERVER_NAME}' at {MCP_SERVER_URL}")
-    status, data = _post("/api/v1/settings/mcp-servers", {"manifest": manifest})
-    if status and 200 <= status < 300:
-        print(f"   OK ({status})")
-        return True
-    elif status == 409 or "already exists" in str(data.get("error", "")).lower():
-        print(f"   already registered -- fine, reusing it. Update it via "
-              f"PUT /api/v1/settings/mcp-servers or the UI if you changed the URL/tools.")
-        return True
-    else:
-        print(f"   FAILED ({status}): {data}")
-        print("   Fall back to the UI: Settings -> Connectors -> Add server, using:")
-        print("   " + json.dumps(manifest, indent=2).replace("\n", "\n   "))
-        return False
+    return _upsert("MCP server", "/api/v1/settings/mcp-servers", MCP_SERVER_NAME,
+                    {"manifest": manifest}, manifest)
 
 
 def register_agent(mcp_server_ready: bool, skill_ready: bool) -> bool:
@@ -178,20 +221,8 @@ def register_agent(mcp_server_ready: bool, skill_ready: bool) -> bool:
             "iteration_limit": 40,
         },
     }
-    print(f"-> registering agent '{AGENT_NAME}' (model={MODEL_NAME})")
-    status, data = _post("/api/v1/agents", {"name": AGENT_NAME, "manifest": spec})
-    if status and 200 <= status < 300:
-        print(f"   OK ({status})")
-        return True
-    elif status == 409 or (data.get("error") and "exists" in str(data.get("error")).lower()):
-        print(f"   agent already exists -- update it via PUT /api/v1/agents/{AGENT_NAME} "
-              f"or the UI if you changed the spec.")
-        return True
-    else:
-        print(f"   FAILED ({status}): {data}")
-        print("   Fall back to the UI (Agent Library -> New agent), using this spec:")
-        print("   " + json.dumps(spec, indent=2).replace("\n", "\n   "))
-        return False
+    return _upsert("agent", "/api/v1/agents", AGENT_NAME,
+                    {"name": AGENT_NAME, "manifest": spec}, spec)
 
 
 def register_skill() -> bool:
@@ -216,20 +247,8 @@ def register_skill() -> bool:
         "description": "SRE operational playbook: triage -> sandbox diagnostic -> "
                         "gated rollback -> verify -> incident report.",
     }
-    print(f"-> registering skill '{SKILL_NAME}' from {GITHUB_REPO} :: skills/{SKILL_NAME} @ {SKILL_REF}")
-    status, data = _post("/api/v1/settings/skills", {"manifest": manifest})
-    if status and 200 <= status < 300:
-        print(f"   OK ({status})")
-        return True
-    elif status == 409 or "already exists" in str(data.get("error", "")).lower():
-        print(f"   already registered -- fine, reusing it. Update it via the UI "
-              f"(Settings -> Skills) if you changed the path/ref.")
-        return True
-    else:
-        print(f"   FAILED ({status}): {data}")
-        print("   Fall back to the UI: Settings -> Skills -> Add skill, using:")
-        print("   " + json.dumps(manifest, indent=2).replace("\n", "\n   "))
-        return False
+    return _upsert("skill", "/api/v1/settings/skills", SKILL_NAME,
+                    {"manifest": manifest}, manifest)
 
 
 if __name__ == "__main__":

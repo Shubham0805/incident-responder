@@ -154,14 +154,25 @@ docker compose up --build
 
 This brings up `demo-app` and `sre-tools` (the two services that only ever
 talk to each other over Docker's own internal network, never to your host)
-in containers instead. Run `backend`, the watcher, and the dashboard
-natively as in step 3 above either way — `docker-compose.yml` has the full
-explanation of why those three aren't containerized: an earlier attempt at
-bridging a container to a host-bound TrueForge process (an auto-discovered
-gateway IP paired with a local proxy) turned out not to reliably work on
-Docker Desktop, and carried a real security exposure besides, so it was
-removed rather than patched further once the fully-native path was proven
-to work instead.
+in containers instead, publishing them on the same `8081`/`8082` ports the
+native versions use. `backend`, the watcher, and the dashboard still need
+to run natively either way — `docker-compose.yml` has the full explanation
+of why those three aren't containerized: an earlier attempt at bridging a
+container to a host-bound TrueForge process (an auto-discovered gateway IP
+paired with a local proxy) turned out not to reliably work on Docker
+Desktop, and carried a real security exposure besides, so it was removed
+rather than patched further once the fully-native path was proven to work
+instead.
+
+Do the venv/pip-install/`.env`/`register.py` setup from step 3 above as
+normal, but when it comes to starting things, run **only** the remaining
+three natively — don't run plain `./scripts/run_all.sh` on its own, since
+it starts its own demo-app/mcp-server too and they'll fail to bind (Compose
+is already holding those ports):
+
+```bash
+SKIP_DEMO_APP=1 SKIP_MCP_SERVER=1 ./scripts/run_all.sh
+```
 
 ## Safety
 

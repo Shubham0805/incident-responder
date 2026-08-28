@@ -4,6 +4,14 @@
 # dashboard. Does NOT start TrueForge itself -- run
 # `npx @truefoundry/trueforge@latest` in its own terminal first, and run
 # scripts/register.py once before this.
+#
+# If demo-app and/or the MCP server are already running elsewhere (e.g. via
+# `docker compose up`, which publishes them on the same 8081/8082 ports),
+# set SKIP_DEMO_APP=1 and/or SKIP_MCP_SERVER=1 so this script doesn't start
+# a second copy that fails to bind. (Flagged by Qodo: the README's Docker
+# section used to say to run "the rest natively as in step 3", but step 3
+# is this script unconditionally starting native demo-app/mcp-server too --
+# a guaranteed port clash with Compose's copies.)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -26,15 +34,22 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "-> demo-app on ${DEMO_APP_URL}"
-python demo-app/app.py > /tmp/demo-app.log 2>&1 &
-PIDS+=($!)
+if [ "${SKIP_DEMO_APP:-0}" = "1" ]; then
+  echo "-> demo-app: SKIP_DEMO_APP=1, assuming it's already up on ${DEMO_APP_URL}"
+else
+  echo "-> demo-app on ${DEMO_APP_URL}"
+  python demo-app/app.py > /tmp/demo-app.log 2>&1 &
+  PIDS+=($!)
+  sleep 1
+fi
 
-sleep 1
-
-echo "-> sre-tools MCP server on ${MCP_SERVER_URL}"
-python mcp-server/sre_tools_server.py > /tmp/mcp-server.log 2>&1 &
-PIDS+=($!)
+if [ "${SKIP_MCP_SERVER:-0}" = "1" ]; then
+  echo "-> sre-tools MCP server: SKIP_MCP_SERVER=1, assuming it's already up on ${MCP_SERVER_URL}"
+else
+  echo "-> sre-tools MCP server on ${MCP_SERVER_URL}"
+  python mcp-server/sre_tools_server.py > /tmp/mcp-server.log 2>&1 &
+  PIDS+=($!)
+fi
 
 echo "-> backend orchestrator on ${BACKEND_URL}"
 python backend/main.py > /tmp/backend.log 2>&1 &
