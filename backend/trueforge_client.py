@@ -35,6 +35,14 @@ from typing import Callable, Iterator
 
 import httpx
 
+# backend always runs directly on your machine, never in a container (see
+# the "Why the split" note at the top of docker-compose.yml) -- so this is
+# always a plain host-facing URL, no container-networking tricks needed.
+# An earlier version of this file resolved a `__DOCKER_GATEWAY__` placeholder
+# to reach TrueForge from inside a Docker container; Qodo's review correctly
+# caught that the gateway IP it discovered belongs to Docker Desktop's own
+# internal VM, not the actual host, so it didn't reliably work -- removed
+# rather than patched further, since backend no longer needs it at all.
 BASE_URL = os.environ.get("TRUEFORGE_BASE_URL", "http://localhost:8790").rstrip("/")
 API_KEY = os.environ.get("TRUEFORGE_API_KEY", "").strip()
 

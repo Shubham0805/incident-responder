@@ -1,17 +1,32 @@
-# Brings up everything EXCEPT TrueForge itself in one command:
+# Containerizes the two services that never need to reach TrueForge or each
+# other across a host boundary: demo-app and the sre-tools MCP server. They
+# only ever talk to each other over compose's own internal network, which
+# has always worked reliably.
+#
 #   docker compose up --build
 #
-# TrueForge stays outside this file on purpose -- run it the way its own
-# docs describe (`npx @truefoundry/trueforge@latest`, or its own Docker
-# Compose) directly on your host. That keeps this repo decoupled from
-# TrueForge's own release process, and keeps networking simple: every
-# service below is reachable from your host via localhost on its published
-# port, and the backend reaches TrueForge on your host via
-# host.docker.internal.
+# backend, the telemetry watcher, and the dashboard are NOT here -- run
+# those natively (`./scripts/run_all.sh` covers all five processes at once
+# if you'd rather skip Docker entirely, which is the primary, actually
+# verified path -- see the README).
 #
-# First run: copy .env.example to .env and fill in TRUEFORGE_AGENT_NAME /
-# TRUEFORGE_MODEL etc. if you want non-default values -- everything has a
-# sane default otherwise.
+# Why the split: backend/watcher/dashboard all need to reach TrueForge
+# and/or each other, which means a container reaching a process on your
+# actual host. We tried this (an auto-discovered Docker-bridge-gateway IP
+# paired with a host-side proxy) and it looked plausible, but Qodo's review
+# caught the real flaw live: that gateway IP belongs to Docker Desktop's own
+# internal Linux VM, not your Mac/Windows host directly, so it doesn't
+# reliably reach a process you're running on your actual machine -- and the
+# proxy that mechanism needed was bound to all network interfaces, which is
+# a real exposure (an unauthenticated local TrueForge instance reachable
+# from your whole network) for a benefit that didn't reliably work anyway.
+# Rather than patch a fundamentally shaky mechanism further, this splits the
+# architecture along the boundary that's actually solid: containers only
+# talk to other containers here, everything that needs the host runs on it
+# directly.
+#
+# First run: copy .env.example to .env if you want non-default values --
+# everything has a sane default otherwise.
 
 services:
   demo-app:
@@ -30,46 +45,3 @@ services:
       DEMO_APP_URL: "http://demo-app:8081"
     depends_on:
       - demo-app
-
-  backend:
-    build: ./backend
-    ports:
-      - "8083:8083"
-    environment:
-      BACKEND_PORT: "8083"
-      DEMO_APP_URL: "http://demo-app:8081"
-      # TrueForge itself runs on your HOST (not in this compose file), so
-      # the backend container reaches it via host.docker.internal.
-      TRUEFORGE_BASE_URL: "${TRUEFORGE_BASE_URL:-http://host.docker.internal:8790}"
-      TRUEFORGE_API_KEY: "${TRUEFORGE_API_KEY:-}"
-      TRUEFORGE_AGENT_NAME: "${TRUEFORGE_AGENT_NAME:-incident-responder}"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"  # needed on Linux; no-op on Docker Desktop
-    depends_on:
-      - demo-app
-
-  watcher:
-    build: ./telemetry
-    environment:
-      DEMO_APP_URL: "http://demo-app:8081"
-      BACKEND_URL: "http://backend:8083"
-      ERROR_RATE_THRESHOLD: "${ERROR_RATE_THRESHOLD:-85}"
-    depends_on:
-      - demo-app
-      - backend
-
-  dashboard:
-    build: ./dashboard
-    ports:
-      - "8501:8501"
-    environment:
-      BACKEND_URL: "http://backend:8083"
-      DEMO_APP_URL: "http://demo-app:8081"
-      # These two are only used for on-screen labels/links a human clicks
-      # from their OWN browser on the host, so -- unlike the backend above
-      # -- they stay as host-facing localhost URLs, not host.docker.internal.
-      TRUEFORGE_BASE_URL: "http://localhost:8790"
-      MCP_SERVER_URL: "http://localhost:8082/mcp"
-    depends_on:
-      - demo-app
-      - backend

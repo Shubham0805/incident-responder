@@ -77,8 +77,26 @@ def _record_event(evt: dict) -> None:
 
         elif etype == "turn.done":
             STATE["final_report"] = _extract_final_report()
-            if STATE["status"] not in ("remediation_denied",):
+            if STATE["status"] == "remediating":
                 STATE["status"] = "resolved"
+            elif STATE["status"] == "remediation_denied":
+                pass  # leave as denied -- the human's decision stands
+            elif STATE["status"] == "investigating":
+                # The turn ended without ever reaching an approval step --
+                # found live: this used to unconditionally flip to
+                # "resolved" here, so a turn that actually failed partway
+                # through (e.g. the sre-tools MCP server being unreachable,
+                # producing only turn.created + turn.done with nothing in
+                # between) still showed a false "HEALTHY — resolved" banner.
+                STATE["status"] = "error"
+                if not STATE.get("error"):
+                    STATE["error"] = (
+                        "Turn ended without ever reaching a remediation step -- "
+                        "the agent likely didn't complete its investigation. "
+                        "Check TrueForge's own session/turn detail for the real cause."
+                    )
+            # else: some other in-between status -- leave it as-is rather
+            # than guessing
 
 
 def _resolve_tool_call(call_ref: dict) -> tuple[str, dict]:
