@@ -98,7 +98,11 @@ def _post(path: str, body: dict) -> tuple[int, dict]:
         return -1, {"error": str(exc)}
 
 
-def register_mcp_server():
+def register_mcp_server() -> bool:
+    """Returns True if the MCP server exists on TrueForge by the time this
+    returns (freshly created OR already there from a prior run), False if
+    it genuinely doesn't. The agent spec references this server by name, so
+    a caller needs to know whether it's safe to proceed."""
     manifest = {
         "type": "remote",
         "name": MCP_SERVER_NAME,
@@ -112,16 +116,37 @@ def register_mcp_server():
     status, data = _post("/api/v1/settings/mcp-servers", {"manifest": manifest})
     if status and 200 <= status < 300:
         print(f"   OK ({status})")
+        return True
     elif status == 409 or "already exists" in str(data.get("error", "")).lower():
         print(f"   already registered -- fine, reusing it. Update it via "
               f"PUT /api/v1/settings/mcp-servers or the UI if you changed the URL/tools.")
+        return True
     else:
         print(f"   FAILED ({status}): {data}")
         print("   Fall back to the UI: Settings -> Connectors -> Add server, using:")
         print("   " + json.dumps(manifest, indent=2).replace("\n", "\n   "))
+        return False
 
 
-def register_agent():
+def register_agent(mcp_server_ready: bool, skill_ready: bool) -> bool:
+    """The agent manifest references both the MCP server and the skill by
+    name -- TrueForge 422s ("Unknown skill/server ... not configured") if
+    either doesn't actually exist yet. Registering the agent anyway in that
+    case is a guaranteed cascading failure dressed up as success. (Flagged
+    by Qodo: this used to run unconditionally and still print "Done" even
+    when the skill step had failed or been skipped.)"""
+    if not mcp_server_ready or not skill_ready:
+        missing = []
+        if not mcp_server_ready:
+            missing.append(f"MCP server '{MCP_SERVER_NAME}'")
+        if not skill_ready:
+            missing.append(f"skill '{SKILL_NAME}'")
+        print(f"-> SKIPPING agent registration: {', '.join(missing)} not confirmed "
+              f"registered above. The agent spec references both by name and "
+              f"TrueForge will reject it (422 'Unknown ... not configured') "
+              f"otherwise. Fix whatever failed above and re-run this script.")
+        return False
+
     if not MODEL_NAME:
         print("-> SKIPPING agent registration: TRUEFORGE_MODEL is not set.")
         print("   Run this first to see the exact string TrueForge expects for your")
@@ -129,7 +154,7 @@ def register_agent():
         print(f"     curl -s {BASE_URL}/api/v1/models | python3 -m json.tool")
         print("   Then set TRUEFORGE_MODEL in .env (e.g. google-gemini/gemini-3-6-flash)")
         print("   and re-run this script.")
-        return
+        return False
 
     spec = {
         "model": {"name": MODEL_NAME},
@@ -157,16 +182,22 @@ def register_agent():
     status, data = _post("/api/v1/agents", {"name": AGENT_NAME, "manifest": spec})
     if status and 200 <= status < 300:
         print(f"   OK ({status})")
+        return True
     elif status == 409 or (data.get("error") and "exists" in str(data.get("error")).lower()):
         print(f"   agent already exists -- update it via PUT /api/v1/agents/{AGENT_NAME} "
               f"or the UI if you changed the spec.")
+        return True
     else:
         print(f"   FAILED ({status}): {data}")
         print("   Fall back to the UI (Agent Library -> New agent), using this spec:")
         print("   " + json.dumps(spec, indent=2).replace("\n", "\n   "))
+        return False
 
 
-def register_skill():
+def register_skill() -> bool:
+    """Returns True if the skill exists on TrueForge by the time this
+    returns, False otherwise -- see register_mcp_server()'s docstring for
+    why the caller needs this."""
     if "<you>/<repo>" in GITHUB_REPO:
         print("-> SKIPPING skill registration: GITHUB_REPO_URL is not set (still the")
         print("   placeholder). The skill registry is git-backed, so it needs a real")
@@ -174,7 +205,7 @@ def register_skill():
         print("     GITHUB_REPO_URL=https://github.com/<you>/incident-responder")
         print("   and re-run this script -- or add it by hand in Settings -> Skills:")
         print(f"     name: {SKILL_NAME}  path: skills/{SKILL_NAME}  ref: {SKILL_REF}")
-        return
+        return False
 
     manifest = {
         "type": "git",
@@ -189,24 +220,38 @@ def register_skill():
     status, data = _post("/api/v1/settings/skills", {"manifest": manifest})
     if status and 200 <= status < 300:
         print(f"   OK ({status})")
+        return True
     elif status == 409 or "already exists" in str(data.get("error", "")).lower():
         print(f"   already registered -- fine, reusing it. Update it via the UI "
               f"(Settings -> Skills) if you changed the path/ref.")
+        return True
     else:
         print(f"   FAILED ({status}): {data}")
         print("   Fall back to the UI: Settings -> Skills -> Add skill, using:")
         print("   " + json.dumps(manifest, indent=2).replace("\n", "\n   "))
+        return False
 
 
 if __name__ == "__main__":
     print(f"TrueForge at {BASE_URL} -- make sure it's already running.\n")
-    register_mcp_server()
+    mcp_ok = register_mcp_server()
     print()
     # Skill must be registered BEFORE the agent -- the agent spec references
     # it by name (`skills: [{"name": SKILL_NAME}]`), and TrueForge 422s with
     # "Unknown skill ... not configured" if it doesn't exist yet. (Caught by
     # a live run: the original ordering here registered the agent first.)
-    register_skill()
+    skill_ok = register_skill()
     print()
-    register_agent()
-    print("\nDone. Then: ./scripts/run_all.sh (or docker compose up, if not already running)")
+    agent_ok = register_agent(mcp_server_ready=mcp_ok, skill_ready=skill_ok)
+
+    print()
+    if mcp_ok and skill_ok and agent_ok:
+        print("Done -- all three registered. Then: ./scripts/run_all.sh "
+              "(or docker compose up, if not already running)")
+    else:
+        failed = [name for name, ok in
+                  [("MCP server", mcp_ok), ("skill", skill_ok), ("agent", agent_ok)]
+                  if not ok]
+        print(f"NOT fully done -- {', '.join(failed)} registration did not succeed. "
+              f"Fix the issue(s) above and re-run this script before starting the app.")
+        sys.exit(1)

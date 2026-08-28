@@ -88,18 +88,27 @@ and Daytona keys directly into TrueForge's own Settings UI at `localhost:8790`.
 
 ## Prerequisites (you set these up yourself — see Safety note below)
 
-- Docker + Docker Compose (recommended path below) **or** Python 3.11+ if
-  you'd rather run things natively (alternative path below)
-- Node.js 22.14+, for TrueForge itself — this always runs directly on your
-  host, in or out of Docker (see "Why isn't TrueForge in the compose file"
-  below)
+- Python 3.11+ (the `mcp` package this project depends on requires it — on
+  macOS the system default `python3` is often older, e.g. 3.9; check with
+  `python3 --version` and install a newer one via Homebrew if needed:
+  `brew install python@3.11`)
+- Node.js 22.14+, for TrueForge itself
+- Docker + Docker Compose — optional, only needed if you want `demo-app` and
+  the `sre-tools` MCP server containerized (see below); everything else runs
+  natively either way
 - One LLM provider key, added in TrueForge's Settings → Models
 - A [Daytona](https://www.daytona.io/) API key, added in TrueForge's
   Settings → Sandbox providers (TrueForge's only sandbox provider today)
 - A [Qodo Merge](https://www.qodo.ai/) GitHub App installed on your repo
   (free 14-day trial, no card) — required for hackathon submission
 
-## Setup & running (Docker — recommended, this is what judges should use)
+## Setup & running
+
+This is the path actually verified end-to-end against a live TrueForge
+instance — every process (demo-app, the sre-tools MCP server, the backend
+orchestrator, the telemetry watcher, and the dashboard) runs directly on
+your machine, talking to each other and to TrueForge over plain
+`localhost`. No container networking involved anywhere.
 
 ```bash
 # 1. Start the harness in its own terminal and leave it running
@@ -108,82 +117,51 @@ npx @truefoundry/trueforge@latest
 # 2. In TrueForge's UI (localhost:8790): Settings -> Models (add your LLM key)
 #    and Settings -> Sandbox providers (add your Daytona key).
 
-# 3. `npx trueforge` only binds to loopback (127.0.0.1) -- there's no --host
-#    flag to change that. Docker containers reaching your machine over the
-#    bridge network is a different path than "localhost", so without this
-#    proxy the backend container's connection gets refused even though the
-#    route itself works. Run this in its own terminal too, and leave it running:
-python3 scripts/host_proxy.py
-
-# 4. Everything else -- demo-app, sre-tools MCP server, backend, telemetry
-#    watcher, dashboard -- in one command
+# 3. In a second terminal
 cd incident-responder
-cp .env.example .env   # adjust only if you changed a port above
-docker compose up --build
-
-# 5. In a fourth terminal, one-time registration against your running
-#    TrueForge instance (needs Python + httpx locally -- this one script is
-#    not itself containerized, it just makes HTTP calls to localhost:8790)
-python3 -m pip install httpx --break-system-packages 2>/dev/null || python3 -m pip install httpx
-python3 scripts/register.py
-```
-
-Open **http://localhost:8501** for the dashboard. `docker compose down` stops
-the containers (TrueForge and `host_proxy.py`, running on your host, are
-unaffected -- stop those with Ctrl+C when you're done).
-
-### Why isn't TrueForge in the compose file?
-
-TrueForge ships its own official Docker Compose setup, versioned with the
-harness itself. Nesting a copy of that inside this repo's compose file would
-mean tracking a moving target and getting cross-container networking right
-for infrastructure we don't own. Running TrueForge the way its own docs
-describe (`npx ...` or its own compose) and letting this repo's containers
-reach it is simpler and won't silently drift out of date. Every service in
-`docker-compose.yml` here is still one command.
-
-### Why does this need a host proxy at all?
-
-Found running the actual stack end-to-end, not assumed: on Docker Desktop
-for Mac, `host.docker.internal` -- the usual way a container reaches its
-host -- resolved to an unroutable IPv6 address, and removing our own
-`extra_hosts` override didn't change that (Docker Desktop's own DNS is the
-source). Separately, `npx trueforge` binds only to loopback, so even a
-working route to your machine gets refused. `scripts/host_proxy.py` and the
-gateway auto-discovery in `backend/trueforge_client.py` route around both
-issues at once, without needing you to hardcode a machine-specific IP
-anywhere.
-
-### Alternative: run natively (no Docker)
-
-```bash
-npx @truefoundry/trueforge@latest   # same as step 1 above, own terminal
-
-cd incident-responder
-python3 -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate   # use python3.11+ here, see Prerequisites
+pip install --upgrade pip
 pip install -r demo-app/requirements.txt -r mcp-server/requirements.txt \
             -r backend/requirements.txt -r dashboard/requirements.txt \
             -r telemetry/requirements.txt
 cp .env.example .env
+# Fill in TRUEFORGE_MODEL (exact "provider/model" string -- see the comment
+# in .env.example) and, once you've pushed this repo, GITHUB_REPO_URL.
 
-python scripts/register.py
+python scripts/register.py   # registers the MCP server, skill, and agent --
+                              # re-run any time you change the manifests
 ./scripts/run_all.sh
 ```
 
-Both paths use the exact same env vars (see `.env.example`) and land on the
-same ports, so they're interchangeable — use whichever the judge running
-this already has installed.
+Open **http://localhost:8501** for the dashboard, then either wait for the
+watcher to notice organic errors or hit **Inject Failure** (calls
+`demo-app`'s `/chaos/inject`) to trigger the incident on demand for a live
+demo. `Ctrl+C` in that terminal stops demo-app/mcp-server/backend/watcher/
+dashboard together; stop TrueForge separately with `Ctrl+C` in its own
+terminal.
 
 Registering the skill needs `skills/sre-playbook/` to be reachable from a git
-remote (TrueForge's Skills registry is git-backed). Push this repo to GitHub
-first, then point `scripts/register.py` / TrueForge Settings → Skills at
-`https://github.com/<you>/<repo> :: skills/sre-playbook`. See comments in
-`scripts/register.py` for the exact call.
+remote (TrueForge's Skills registry is git-backed) — push this repo to
+GitHub before running `scripts/register.py`, and set `GITHUB_REPO_URL` in
+`.env` to it.
 
-Either way, open the dashboard, then either wait for the watcher to notice
-organic errors or hit the **Inject Failure** button on the dashboard (calls
-`demo-app`'s `/chaos/inject`) to trigger the incident on demand for a live
-demo.
+### Optional: containerize demo-app and the MCP server
+
+```bash
+cd incident-responder
+docker compose up --build
+```
+
+This brings up `demo-app` and `sre-tools` (the two services that only ever
+talk to each other over Docker's own internal network, never to your host)
+in containers instead. Run `backend`, the watcher, and the dashboard
+natively as in step 3 above either way — `docker-compose.yml` has the full
+explanation of why those three aren't containerized: an earlier attempt at
+bridging a container to a host-bound TrueForge process (an auto-discovered
+gateway IP paired with a local proxy) turned out not to reliably work on
+Docker Desktop, and carried a real security exposure besides, so it was
+removed rather than patched further once the fully-native path was proven
+to work instead.
 
 ## Safety
 
@@ -209,15 +187,20 @@ demo.
 
 ```
 demo-app/        fake production service + chaos injector (+ Dockerfile)
-telemetry/       mock monitoring that fires the incident webhook (+ Dockerfile)
+telemetry/       mock monitoring that fires the incident webhook
 mcp-server/      our sre-tools MCP server (tail_log, apply_system_change) (+ Dockerfile)
 skills/sre-playbook/   the SRE operational manual (SKILL.md) the agent follows
-backend/         FastAPI orchestrator: webhook -> TrueForge session -> SSE -> /state, /approve (+ Dockerfile)
-dashboard/       Streamlit "mission control" UI for judges (+ Dockerfile)
+backend/         FastAPI orchestrator: webhook -> TrueForge session -> SSE -> /state, /approve
+dashboard/       Streamlit "mission control" UI for judges
 scripts/         one-time registration + local run-everything script (native path)
-docker-compose.yml   one command for demo-app + mcp-server + backend + watcher + dashboard
+docker-compose.yml   containerizes demo-app + mcp-server only -- see below
 ```
 
-Each of the five services above is also a small standalone container — see
+`demo-app` and `mcp-server` are also small standalone containers — see
 `docker-compose.yml` at the repo root for how they're wired together, and
-"Setup & running (Docker)" above for the one-command path.
+"Optional: containerize demo-app and the MCP server" above for that path.
+backend, telemetry, and dashboard all need to reach TrueForge and/or each
+other across the host boundary, so they run natively; see the "Why the
+split" comment at the top of `docker-compose.yml`. Their `Dockerfile`s
+(where present) are leftovers from an earlier all-Docker layout and aren't
+referenced by `docker-compose.yml` anymore.

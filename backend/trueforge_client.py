@@ -35,55 +35,15 @@ from typing import Callable, Iterator
 
 import httpx
 
-
-def _docker_bridge_gateway() -> str | None:
-    """Read this container's default-route gateway straight from
-    /proc/net/route (pure stdlib -- python:3.11-slim doesn't ship `ip` or
-    `route`). Only meaningful inside a Linux container on Docker's bridge
-    network; returns None when it's not available (e.g. running natively,
-    not in Docker) so callers can fall back cleanly."""
-    import socket
-    import struct
-
-    try:
-        with open("/proc/net/route") as f:
-            for line in f.readlines()[1:]:
-                fields = line.split()
-                if len(fields) >= 3 and fields[1] == "00000000":
-                    return socket.inet_ntoa(struct.pack("<L", int(fields[2], 16)))
-    except (FileNotFoundError, OSError, ValueError):
-        pass
-    return None
-
-
-def _resolve_base_url() -> str:
-    """TRUEFORGE_BASE_URL may contain the literal placeholder host
-    `__DOCKER_GATEWAY__` (set by docker-compose.yml for the `backend`
-    service specifically) instead of a real hostname.
-
-    Found live, on Docker Desktop for Mac, verifying an actual dry run --
-    neither of the two "obvious" ways to reach the host from inside a
-    container held up: `localhost` means "this container", not your
-    machine, and `host.docker.internal` resolved to an unroutable IPv6
-    address in this environment even after removing our own extra_hosts
-    override (Docker Desktop's own DNS gave only an IPv6 AAAA record here).
-    `npx trueforge` itself also only binds to loopback -- no --host flag
-    exists to change that.
-
-    The fix: the Docker bridge gateway IP always routes back to the host
-    (confirmed live via /proc/net/route + a raw connection test), so we
-    discover it at runtime and pair it with scripts/host_proxy.py, which
-    listens on all interfaces on the host and forwards to TrueForge's
-    loopback-only port.
-    """
-    raw = os.environ.get("TRUEFORGE_BASE_URL", "http://localhost:8790").rstrip("/")
-    if "__DOCKER_GATEWAY__" in raw:
-        gw = _docker_bridge_gateway() or "host.docker.internal"  # best-effort fallback
-        return raw.replace("__DOCKER_GATEWAY__", gw)
-    return raw
-
-
-BASE_URL = _resolve_base_url()
+# backend always runs directly on your machine, never in a container (see
+# the "Why the split" note at the top of docker-compose.yml) -- so this is
+# always a plain host-facing URL, no container-networking tricks needed.
+# An earlier version of this file resolved a `__DOCKER_GATEWAY__` placeholder
+# to reach TrueForge from inside a Docker container; Qodo's review correctly
+# caught that the gateway IP it discovered belongs to Docker Desktop's own
+# internal VM, not the actual host, so it didn't reliably work -- removed
+# rather than patched further, since backend no longer needs it at all.
+BASE_URL = os.environ.get("TRUEFORGE_BASE_URL", "http://localhost:8790").rstrip("/")
 API_KEY = os.environ.get("TRUEFORGE_API_KEY", "").strip()
 
 
