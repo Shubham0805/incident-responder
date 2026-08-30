@@ -251,6 +251,25 @@ with right:
         st.markdown(f'<div class="diff-label">{label}</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="diff-box diff-after">{html.escape(str(after_dsn))}</div>', unsafe_allow_html=True)
 
+    # A rollback always restores the WHOLE last-known-good config together
+    # (DSN and pool_size), even though the approval arguments only ever
+    # carry `dsn`. For a pool_shrink-only incident the DSN above shows no
+    # change at all -- without this, that made the approval look like a
+    # no-op even though pool_size is about to be restored too. Only shown
+    # when it's actually drifted, so the common DSN-only case stays clean.
+    # (Qodo, bug #5: "Pool rollback hidden from approver".)
+    current_pool = db_status.get("current_pool_size")
+    good_pool = db_status.get("last_known_good_pool_size")
+    if current_pool is not None and good_pool is not None and current_pool != good_pool:
+        p1, p2 = st.columns(2)
+        with p1:
+            st.markdown('<div class="diff-label">CURRENT pool_size</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="diff-box diff-before">{current_pool}</div>', unsafe_allow_html=True)
+        with p2:
+            plabel = "PROPOSED pool_size (pending approval)" if pending else "LAST-KNOWN-GOOD pool_size (target)"
+            st.markdown(f'<div class="diff-label">{plabel}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="diff-box diff-after">{good_pool}</div>', unsafe_allow_html=True)
+
     st.divider()
 
     # --- Intercept Gate -----------------------------------------------

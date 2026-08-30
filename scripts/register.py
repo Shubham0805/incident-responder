@@ -80,7 +80,13 @@ MINER_SKILL_REF = os.environ.get("TRUEFORGE_MINER_SKILL_REF", SKILL_REF)
 # setup, so this intentionally has no fallback -- the script fails loudly
 # instead of silently registering an agent that can never run a turn.
 MODEL_NAME = os.environ.get("TRUEFORGE_MODEL")
-MINER_MODEL_NAME = os.environ.get("TRUEFORGE_MINER_MODEL", MODEL_NAME)
+# os.environ.get()'s default only applies when the key is ABSENT --
+# .env.example documents TRUEFORGE_MINER_MODEL as an empty value, and a
+# literal copy of it sets the key present-but-empty, which would silently
+# skip miner registration instead of inheriting TRUEFORGE_MODEL as
+# intended. Strip and treat empty the same as unset. (Qodo, bug #4:
+# "Empty override disables miner".)
+MINER_MODEL_NAME = os.environ.get("TRUEFORGE_MINER_MODEL", "").strip() or MODEL_NAME
 
 # Only needed for the skill registration below -- the skill registry is
 # git-backed, so it needs a real pushed repo, not a local-only folder.

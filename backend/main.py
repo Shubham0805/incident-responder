@@ -72,6 +72,13 @@ TOOL_STAGE_LABELS = {
 }
 
 STATE: dict[str, Any] = {
+    # Bumped on every fresh reset point (webhook_incident, reset,
+    # debug_simulate_llm_failure) -- background workers that do blocking
+    # I/O (the deterministic fallback, its fix-application) capture this
+    # before they block and check it again before writing STATE back, so
+    # a stale worker for a superseded incident can't clobber a newer one.
+    # (Qodo, bug #3: "Stale fallback overwrites incidents".)
+    "generation": 0,
     "status": "idle",  # idle | investigating | intervention_required | remediating | remediation_denied | resolved
     "stage": STAGE_LABELS["idle"],  # finer-grained label for the dashboard's Status Orb
     "alert": None,
@@ -240,7 +247,14 @@ def _update_stage() -> None:
                 name = (c0.get("function") or {}).get("name") or c0.get("name")
                 STATE["stage"] = TOOL_STAGE_LABELS.get(name, f"🧠 Using {name}")
                 return
-            if (d.get("content") or "").strip():
+            # Route through _extract_message_text() rather than calling
+            # .strip() on d["content"] directly -- content can be a list of
+            # blocks or a nested dict (see _extract_message_text()'s own
+            # docstring), and .strip() on either raises AttributeError here,
+            # which aborts _record_event() mid-event and can even swallow
+            # the run_fallback trigger further down the same call. (Qodo,
+            # bug #1: "Structured messages crash stage updates".)
+            if (_extract_message_text(d.get("content")) or "").strip():
                 STATE["stage"] = "🧠 Reasoning about the incident"
                 return
         if entry["type"] == "sandbox.created":
@@ -254,6 +268,7 @@ def _record_event(evt: dict) -> None:
     transparent log, index it, and react to the ones that matter."""
     global _seq
     run_fallback = False
+    fallback_generation = None
     with _lock:
         _seq += 1
         entry = {"seq": _seq, "at": _now(), "type": evt.get("type"), "data": evt}
@@ -330,13 +345,14 @@ def _record_event(evt: dict) -> None:
                 # actually diagnose it deterministically. Runs after the lock
                 # is released below, since it makes blocking HTTP calls.
                 run_fallback = True
+                fallback_generation = STATE["generation"]
             # else: some other in-between status -- leave it as-is rather
             # than guessing
 
         _update_stage()
 
     if run_fallback:
-        threading.Thread(target=_run_deterministic_fallback, daemon=True).start()
+        threading.Thread(target=_run_deterministic_fallback, args=(fallback_generation,), daemon=True).start()
 
 
 def _index_tool_calls(source_evt: dict) -> None:
@@ -410,6 +426,16 @@ def _extract_final_report() -> str | None:
             text = _extract_message_text(entry["data"].get("content"))
             if text:
                 return text
+    # Live-verified (Aug 28 dry run): the final model.message can carry NO
+    # content at all, with the actual narration having streamed in only via
+    # model.message.delta instead -- buffered per-thread into terminal_log's
+    # "agent" entries by _record_event(). Without this fallback, that whole
+    # class of turn ends with an empty final_report despite the model
+    # plainly having said something. (Qodo, bug #6: "Delta-only reports are
+    # discarded".)
+    agent_lines = [e["text"] for e in STATE["terminal_log"] if e.get("kind") == "agent" and e.get("text")]
+    if agent_lines:
+        return agent_lines[-1]
     return None
 
 
@@ -417,20 +443,51 @@ def _run_turn(session_id: str, input_items: list[dict]) -> None:
     try:
         tf.stream_turn(session_id, input_items, _record_event)
     except Exception as exc:  # noqa: BLE001 -- surface any harness/network error to the dashboard
+        run_fallback = False
+        fallback_generation = None
         with _lock:
             STATE["error"] = f"{type(exc).__name__}: {exc}"
+            if STATE["status"] == "investigating":
+                # Same resilience net as the turn.done/"investigating" branch
+                # in _record_event() -- a stream that raises outright (network
+                # blip, harness crash, a bug in event handling) has just as
+                # surely never reached remediation as a turn that completes
+                # uneventfully with no tool call. Without this, status stayed
+                # "investigating" forever, and /webhook/incident's idle/resolved
+                # guard rejected every subsequent incident. (Qodo, bug #2:
+                # "Stream failures bypass fallback".) Only when status is still
+                # "investigating" -- if a resumed turn (post-approval) raises
+                # instead, that's a different situation a fresh deterministic
+                # re-diagnosis shouldn't barge into.
+                STATE["status"] = "error"
+                run_fallback = True
+                fallback_generation = STATE["generation"]
+            _update_stage()
+        if run_fallback:
+            threading.Thread(target=_run_deterministic_fallback, args=(fallback_generation,), daemon=True).start()
 
 
-def _run_deterministic_fallback() -> None:
+def _run_deterministic_fallback(generation: int) -> None:
     """Runs when the LLM-driven TrueForge turn ends without ever reaching a
     remediation step (rate-limited, misconfigured model, harness error --
     doesn't matter which). Does the SAME investigation the sre-playbook
     skill describes, but as plain deterministic Python calling demo-app
     directly (see deterministic_fallback.py) -- no LLM involved, so it
     can't fail the same way. Purely a resilience net: prefer the real agent
-    whenever it works; this only runs after it has already failed."""
+    whenever it works; this only runs after it has already failed.
+
+    `generation` is STATE["generation"] as of the moment this was
+    scheduled -- diagnose() below makes blocking HTTP calls, and this
+    process gets no lock held across them, so a /reset or a brand new
+    incident can legitimately happen while this is in flight. Both
+    writes below check the generation is still current before touching
+    STATE, so a stale result is silently discarded instead of clobbering
+    whatever's actually happening now. (Qodo, bug #3: 'Stale fallback
+    overwrites incidents'.)"""
     global _seq
     with _lock:
+        if STATE["generation"] != generation:
+            return  # superseded before this even started
         STATE["status"] = "deterministic_diagnosis"
         STATE["stage"] = STAGE_LABELS["deterministic_diagnosis"]
         _seq += 1
@@ -442,6 +499,8 @@ def _run_deterministic_fallback() -> None:
     result = fallback.diagnose()
 
     with _lock:
+        if STATE["generation"] != generation:
+            return  # a newer incident/reset happened while diagnosing -- discard
         _seq += 1
         STATE["events"].append({
             "seq": _seq, "at": _now(), "type": "fallback.diagnosis",
@@ -478,15 +537,22 @@ def _run_deterministic_fallback() -> None:
             )
 
 
-def _apply_fallback_fix(args: dict) -> None:
+def _apply_fallback_fix(args: dict, generation: int) -> None:
     """Companion to _run_deterministic_fallback: actually applies the
     approved fix directly against demo-app, then polls for recovery --
-    mirrors what the LLM path's step 6 (verify recovery) does."""
+    mirrors what the LLM path's step 6 (verify recovery) does.
+
+    `generation` is captured by the /approve caller at the moment of
+    approval -- same stale-write guard as _run_deterministic_fallback,
+    since apply_fix() and the recovery poll below both block for real
+    time a /reset could happen during. (Qodo, bug #3.)"""
     global _seq
     try:
         result = fallback.apply_fix(args["dsn"], args["reason"])
     except Exception as exc:  # noqa: BLE001
         with _lock:
+            if STATE["generation"] != generation:
+                return
             _seq += 1
             STATE["events"].append({
                 "seq": _seq, "at": _now(), "type": "fallback.apply_failed",
@@ -509,6 +575,8 @@ def _apply_fallback_fix(args: dict) -> None:
             pass
 
     with _lock:
+        if STATE["generation"] != generation:
+            return  # a newer incident/reset happened during apply/poll -- discard
         _seq += 1
         STATE["events"].append({
             "seq": _seq, "at": _now(), "type": "fallback.apply_result",
@@ -773,6 +841,7 @@ def debug_simulate_llm_failure():
             pending_approval=None, final_report=None, events=[], terminal_log=[], error=None,
             session_id="debug-session",
         )
+        STATE["generation"] = STATE.get("generation", 0) + 1
         _event_index.clear()
         _toolcall_index.clear()
         _delta_buffers.clear()
@@ -798,6 +867,7 @@ def webhook_incident(payload: IncidentWebhook):
             terminal_log=[],
             error=None,
         )
+        STATE["generation"] = STATE.get("generation", 0) + 1
         _event_index.clear()
         _toolcall_index.clear()
         _delta_buffers.clear()
@@ -876,7 +946,9 @@ def approve(decision: Decision):
             STATE["status"] = "remediating"
             STATE["stage"] = STAGE_LABELS["remediating"] + " (rule-based fallback, no LLM)"
             STATE["error"] = None
-            threading.Thread(target=_apply_fallback_fix, args=(args,), daemon=True).start()
+            threading.Thread(
+                target=_apply_fallback_fix, args=(args, STATE["generation"]), daemon=True,
+            ).start()
             return {"ok": True}
 
         session_id = STATE.get("session_id")
@@ -1065,6 +1137,7 @@ def reset():
             terminal_log=[],
             error=None,
         )
+        STATE["generation"] = STATE.get("generation", 0) + 1
         _event_index.clear()
         _toolcall_index.clear()
         _delta_buffers.clear()
