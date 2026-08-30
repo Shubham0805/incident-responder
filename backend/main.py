@@ -958,22 +958,33 @@ def webhook_incident(payload: IncidentWebhook):
     try:
         session = tf.create_session(AGENT_NAME)
     except Exception as exc:  # noqa: BLE001 -- TrueForge unreachable/misconfigured
+        error_msg = (
+            f"Could not reach TrueForge at {tf.BASE_URL} to create a session "
+            f"for agent '{AGENT_NAME}': {type(exc).__name__}: {exc}. Is "
+            f"`npx @truefoundry/trueforge@latest` running, and did you run "
+            f"scripts/register.py?"
+        )
         with _lock:
-            STATE["status"] = "idle"
-            STATE["error"] = (
-                f"Could not reach TrueForge at {tf.BASE_URL} to create a session "
-                f"for agent '{AGENT_NAME}': {type(exc).__name__}: {exc}. Is "
-                f"`npx @truefoundry/trueforge@latest` running, and did you run "
-                f"scripts/register.py?"
-            )
-        raise HTTPException(502, STATE["error"])
+            # Only knock STATE back to idle if this request's own incident
+            # is still the current one -- a /reset or a newer incident that
+            # landed while create_session() was blocking already has its own
+            # (possibly still-in-progress) state, which this stale failure
+            # must not stomp.
+            if STATE["generation"] == generation:
+                STATE["status"] = "idle"
+                STATE["error"] = error_msg
+        raise HTTPException(502, error_msg)
 
     session_id = session.get("id") or session.get("session_id") or session.get("data", {}).get("id")
     if not session_id:
+        error_msg = f"TrueForge returned no session id: {session}"
         with _lock:
-            STATE["status"] = "idle"
-            STATE["error"] = f"TrueForge returned no session id: {session}"
-        raise HTTPException(502, STATE["error"])
+            # Same freshness guard as the exception branch above -- see its
+            # comment.
+            if STATE["generation"] == generation:
+                STATE["status"] = "idle"
+                STATE["error"] = error_msg
+        raise HTTPException(502, error_msg)
     with _lock:
         if STATE["generation"] != generation:
             # A /reset or a newer incident landed while tf.create_session()
