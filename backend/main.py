@@ -972,6 +972,7 @@ def webhook_incident(payload: IncidentWebhook):
             # must not stomp.
             if STATE["generation"] == generation:
                 STATE["status"] = "idle"
+                STATE["stage"] = STAGE_LABELS["idle"]
                 STATE["error"] = error_msg
         raise HTTPException(502, error_msg)
 
@@ -983,6 +984,7 @@ def webhook_incident(payload: IncidentWebhook):
             # comment.
             if STATE["generation"] == generation:
                 STATE["status"] = "idle"
+                STATE["stage"] = STAGE_LABELS["idle"]
                 STATE["error"] = error_msg
         raise HTTPException(502, error_msg)
     with _lock:
