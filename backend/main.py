@@ -909,7 +909,7 @@ def debug_simulate_llm_failure():
         _delta_buffers.clear()
         global _seq
         _seq = 0
-    debug_generation = STATE["generation"]
+        debug_generation = STATE["generation"]
     _record_event({"type": "turn.created", "id": "debug-turn"}, debug_generation)
     _record_event({"type": "turn.done", "id": "debug-turn-done", "state": {"status": "error"}}, debug_generation)
     return {"ok": True, "note": "simulated LLM failure injected -- watch the dashboard, zero API calls made"}
@@ -975,8 +975,21 @@ def webhook_incident(payload: IncidentWebhook):
             STATE["error"] = f"TrueForge returned no session id: {session}"
         raise HTTPException(502, STATE["error"])
     with _lock:
+        if STATE["generation"] != generation:
+            # A /reset or a newer incident landed while tf.create_session()
+            # was blocking above (it runs outside _lock on purpose -- it's a
+            # real network call). This session belongs to an incident that's
+            # already been superseded: don't touch STATE (that would let a
+            # stale request overwrite session_id for the newer incident and
+            # launch _run_turn tagged with its generation, defeating the
+            # stale-generation guard in _record_event() entirely) and don't
+            # launch _run_turn for it. trueforge_client exposes no session
+            # cancel/delete call, so the orphaned session is simply
+            # abandoned -- since stream_turn() is never called for it, it
+            # never produces events for anything to have to reject.
+            return {"accepted": False, "session_id": None,
+                    "reason": "superseded by a newer incident or reset while creating the TrueForge session"}
         STATE["session_id"] = session_id
-        generation = STATE["generation"]
 
     intro = (
         f"ALERT: {payload.alert} fired for demo-app. "
