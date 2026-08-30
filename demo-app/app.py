@@ -47,6 +47,8 @@ DB_CONFIG_PATH = STATE_DIR / "db_config.json"
 DB_CONFIG_LAST_GOOD_PATH = STATE_DIR / "db_config.last_good.json"
 
 GOOD_DSN = "postgresql://app:S3cure-Pass@db-primary.internal:5432/app_prod?pool=20"
+GOOD_POOL_SIZE = 20
+BAD_POOL_SIZE = 2               # simulates a misconfigured rollout that shrinks the pool
 BASELINE_ERROR_RATE = 0.02      # healthy traffic still has some noise
 CORRUPTED_ERROR_RATE = 0.90     # what judges will see spike past the 85% threshold
 WINDOW_SECONDS = 20              # rolling window used to compute /metrics error_rate
@@ -67,6 +69,7 @@ _state = {
     "corrupted": False,
     "corrupted_since": None,
     "deploy_id": None,
+    "kind": None,  # "dsn_typo" | "pool_shrink" | "both" -- which chaos was injected
 }
 
 
@@ -108,17 +111,42 @@ def _simulate_requests():
             log.info("GET /api/orders/%d -> 200 OK (12ms)", n)
         else:
             cfg = _read_config()
-            log.error(
-                "GET /api/orders/%d -> 500 Internal Server Error\n"
-                "Traceback (most recent call last):\n"
-                '  File "db/pool.py", line 88, in acquire\n'
-                "    conn = connect(dsn=DB_DSN)\n"
-                "sqlalchemy.exc.OperationalError: could not connect to server: "
-                "Connection refused\n"
-                "    DSN in use: %s\n"
-                "    (pool exhausted after 3 retries, deploy=%s)",
-                n, cfg.get("dsn"), _state.get("deploy_id"),
-            )
+            kind = _state.get("kind")
+            if kind == "pool_shrink":
+                log.error(
+                    "GET /api/orders/%d -> 500 Internal Server Error\n"
+                    "Traceback (most recent call last):\n"
+                    '  File "db/pool.py", line 41, in acquire\n'
+                    "    conn = pool.get(timeout=2)\n"
+                    "sqlalchemy.exc.TimeoutError: QueuePool limit of size %d overflow 0 "
+                    "reached, connection timed out\n"
+                    "    pool_size in use: %d (deploy=%s)",
+                    n, cfg.get("pool_size"), cfg.get("pool_size"), _state.get("deploy_id"),
+                )
+            elif kind == "both":
+                log.error(
+                    "GET /api/orders/%d -> 500 Internal Server Error\n"
+                    "Traceback (most recent call last):\n"
+                    '  File "db/pool.py", line 88, in acquire\n'
+                    "    conn = connect(dsn=DB_DSN)\n"
+                    "sqlalchemy.exc.OperationalError: could not connect to server: "
+                    "Connection refused\n"
+                    "    DSN in use: %s\n"
+                    "    pool_size in use: %d (pool exhausted after 3 retries, deploy=%s)",
+                    n, cfg.get("dsn"), cfg.get("pool_size"), _state.get("deploy_id"),
+                )
+            else:
+                log.error(
+                    "GET /api/orders/%d -> 500 Internal Server Error\n"
+                    "Traceback (most recent call last):\n"
+                    '  File "db/pool.py", line 88, in acquire\n'
+                    "    conn = connect(dsn=DB_DSN)\n"
+                    "sqlalchemy.exc.OperationalError: could not connect to server: "
+                    "Connection refused\n"
+                    "    DSN in use: %s\n"
+                    "    (pool exhausted after 3 retries, deploy=%s)",
+                    n, cfg.get("dsn"), _state.get("deploy_id"),
+                )
         time.sleep(REQUEST_INTERVAL)
 
 
@@ -146,42 +174,57 @@ def metrics():
     }
 
 
-class ChaosResponse(BaseModel):
-    injected: bool
-    deploy_id: str
-    bad_dsn: str
+class ChaosRequest(BaseModel):
+    kind: str = "dsn_typo"  # "dsn_typo" | "pool_shrink" | "both"
+
+
+_BAD_DSN = "postgresql://app:S3cure-Pass@db-primry.internal:5432/app_prod?pool=20"  # typo'd host
+_CHAOS_DESCRIPTIONS = {
+    "dsn_typo": "updated DB_DSN config (db-primary.internal -> db-primry.internal). "
+                "Connection pool will fail to resolve host.",
+    "pool_shrink": f"shrank the DB connection pool_size ({GOOD_POOL_SIZE} -> {BAD_POOL_SIZE}). "
+                   "Connection pool will exhaust under normal load.",
+    "both": "updated DB_DSN config (db-primary.internal -> db-primry.internal) AND shrank "
+            f"pool_size ({GOOD_POOL_SIZE} -> {BAD_POOL_SIZE}).",
+}
 
 
 @app.post("/chaos/inject")
-def chaos_inject():
-    """Simulate a bad deployment corrupting the DB connection string."""
+def chaos_inject(req: ChaosRequest = ChaosRequest()):
+    """Simulate a bad deployment. kind picks which config field(s) drift from
+    known-good -- dsn_typo (default, matches the original demo), pool_shrink
+    (a different, independent fault the same rollback tool still fixes), or
+    both at once (a compound failure)."""
+    kind = req.kind if req.kind in ("dsn_typo", "pool_shrink", "both") else "dsn_typo"
     if _state["corrupted"]:
         cfg = _read_config()
-        return {"injected": False, "deploy_id": _state["deploy_id"], "bad_dsn": cfg["dsn"]}
+        return {
+            "injected": False, "deploy_id": _state["deploy_id"], "kind": _state.get("kind"),
+            "dsn": cfg["dsn"], "pool_size": cfg["pool_size"],
+        }
 
     _save_last_good()
     deploy_id = "deploy-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    bad_dsn = "postgresql://app:S3cure-Pass@db-primry.internal:5432/app_prod?pool=20"  # typo'd host
-    _write_config(bad_dsn, pool_size=20)
+    new_dsn = _BAD_DSN if kind in ("dsn_typo", "both") else GOOD_DSN
+    new_pool = BAD_POOL_SIZE if kind in ("pool_shrink", "both") else GOOD_POOL_SIZE
+    _write_config(new_dsn, pool_size=new_pool)
     _state["corrupted"] = True
     _state["corrupted_since"] = time.time()
     _state["deploy_id"] = deploy_id
-    log.error(
-        "DEPLOYMENT %s rolled out: updated DB_DSN config (db-primary.internal -> "
-        "db-primry.internal). Connection pool will fail to resolve host.",
-        deploy_id,
-    )
-    return {"injected": True, "deploy_id": deploy_id, "bad_dsn": bad_dsn}
+    _state["kind"] = kind
+    log.error("DEPLOYMENT %s rolled out: %s", deploy_id, _CHAOS_DESCRIPTIONS[kind])
+    return {"injected": True, "deploy_id": deploy_id, "kind": kind, "dsn": new_dsn, "pool_size": new_pool}
 
 
 @app.post("/chaos/reset")
 def chaos_reset():
     """Local-testing-only hard reset. The real demo flow uses /internal/rollback
     via the agent's gated apply_system_change tool instead."""
-    _write_config(GOOD_DSN)
+    _write_config(GOOD_DSN, pool_size=GOOD_POOL_SIZE)
     _state["corrupted"] = False
     _state["corrupted_since"] = None
     _state["deploy_id"] = None
+    _state["kind"] = None
     log.info("Manual /chaos/reset called -- DB config restored to known-good.")
     return {"reset": True}
 
@@ -210,6 +253,7 @@ def db_status():
         "current_dsn": cfg["dsn"],
         "pool_size": cfg["pool_size"],
         "last_known_good_dsn": last_good["dsn"],
+        "last_known_good_pool_size": last_good.get("pool_size", GOOD_POOL_SIZE),
         "healthy": not _state["corrupted"],
         "corrupted_since": _state["corrupted_since"],
         "deploy_id": _state["deploy_id"],

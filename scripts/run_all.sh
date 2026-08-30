@@ -15,6 +15,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Auto-activate the repo's venv if one exists and isn't already active --
+# avoids the classic "opened a fresh terminal, forgot to activate" trip,
+# which otherwise surfaces as a confusing "streamlit: command not found"
+# deep inside this script instead of an obvious "activate your venv" hint.
+if [ -z "${VIRTUAL_ENV:-}" ] && [ -f .venv/bin/activate ]; then
+  echo "-> activating .venv (wasn't already active in this shell)"
+  # shellcheck disable=SC1091
+  source .venv/bin/activate
+fi
+
 if [ -f .env ]; then
   set -a; source .env; set +a
 fi

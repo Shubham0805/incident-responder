@@ -66,12 +66,27 @@ MCP_SERVER_NAME = os.environ.get("TRUEFORGE_MCP_SERVER_NAME", "sre-tools")
 SKILL_NAME = os.environ.get("TRUEFORGE_SKILL_NAME", "sre-playbook")
 SKILL_REF = os.environ.get("TRUEFORGE_SKILL_REF", "main")
 
+# Second agent: periodically mines known_patterns.json for merge/threshold/
+# suspicious-flag proposals (see backend/pattern_insights.py). Reuses the
+# same TRUEFORGE_MODEL by default -- override with its own env var only if
+# you want it on a different model than the on-call agent.
+MINER_AGENT_NAME = os.environ.get("TRUEFORGE_MINER_AGENT_NAME", "pattern-miner")
+MINER_SKILL_NAME = os.environ.get("TRUEFORGE_MINER_SKILL_NAME", "pattern-miner")
+MINER_SKILL_REF = os.environ.get("TRUEFORGE_MINER_SKILL_REF", SKILL_REF)
+
 # Must be the full "provider/model" FQN from GET /api/v1/models's `name`
 # field for whatever you configured in Settings -> Models -- see the module
 # docstring above. There's no universal default that works for every judge's
 # setup, so this intentionally has no fallback -- the script fails loudly
 # instead of silently registering an agent that can never run a turn.
 MODEL_NAME = os.environ.get("TRUEFORGE_MODEL")
+# os.environ.get()'s default only applies when the key is ABSENT --
+# .env.example documents TRUEFORGE_MINER_MODEL as an empty value, and a
+# literal copy of it sets the key present-but-empty, which would silently
+# skip miner registration instead of inheriting TRUEFORGE_MODEL as
+# intended. Strip and treat empty the same as unset. (Qodo, bug #4:
+# "Empty override disables miner".)
+MINER_MODEL_NAME = os.environ.get("TRUEFORGE_MINER_MODEL", "").strip() or MODEL_NAME
 
 # Only needed for the skill registration below -- the skill registry is
 # git-backed, so it needs a real pushed repo, not a local-only folder.
@@ -110,19 +125,31 @@ def _put(path: str, body: dict) -> tuple[int, dict]:
         return -1, {"error": str(exc)}
 
 
-def _upsert(kind: str, collection_path: str, name: str, body: dict, manifest: dict) -> bool:
-    """POST to create; if it already exists (409), don't just assume the
-    registered copy still matches -- PUT the current manifest to the item
-    URL to bring it in line, since a rerun after editing a manifest (a new
-    MCP url, skill ref, or model) is exactly when staleness matters most.
-    TrueForge's item-level update route isn't documented, so this is
-    best-effort: if PUT isn't supported here (404/405) or it fails, this
-    still returns True (the resource does exist, so downstream steps that
-    reference it by name are safe) but says plainly that it could NOT
-    confirm the manifest is current, instead of implying it is. (Flagged by
-    Qodo: every 409 path used to print success and reuse the existing
-    resource unconditionally, silently ignoring any manifest changes.)"""
+def _get(path: str) -> tuple[int, dict]:
+    try:
+        resp = httpx.get(f"{BASE_URL}{path}", headers=AUTH_HEADERS, timeout=15)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw": resp.text}
+        return resp.status_code, data
+    except httpx.HTTPError as exc:
+        return -1, {"error": str(exc)}
+
+
+def _upsert_collection(kind: str, collection_path: str, name: str, manifest: dict) -> bool:
+    """For resources whose update route is a name-keyed upsert on the
+    COLLECTION endpoint itself (MCP servers, skills) -- verified against
+    this instance's own /api/v1/openapi.json, not guessed: there is no
+    item-level PUT route for these (`.../{name}` only supports GET); the
+    real update route is `PUT {collection_path}`, documented in the spec
+    as "create or replace by name" / "full upsert keyed by name", with the
+    exact same {"manifest": ...} body POST uses (the name lives inside the
+    manifest already). An earlier version of this script guessed a
+    `.../{name}` item URL for these, which 404/405'd and was silently
+    treated as 'update not supported' -- it was actually just the wrong URL."""
     print(f"-> registering {kind} '{name}'")
+    body = {"manifest": manifest}
     status, data = _post(collection_path, body)
     if status and 200 <= status < 300:
         print(f"   OK ({status})")
@@ -133,24 +160,62 @@ def _upsert(kind: str, collection_path: str, name: str, body: dict, manifest: di
         print("   " + json.dumps(manifest, indent=2).replace("\n", "\n   "))
         return False
 
-    item_url = f"{collection_path}/{name}"
-    put_status, put_data = _put(item_url, body)
+    put_status, put_data = _put(collection_path, body)
     if put_status and 200 <= put_status < 300:
         print(f"   already existed -- updated to match the current manifest ({put_status})")
         return True
-    elif put_status in (404, 405):
-        print(f"   already exists -- this TrueForge instance doesn't expose "
-              f"PUT {item_url}, so this script could NOT confirm the "
-              f"registered {kind} matches the manifest below. If you changed "
-              f"anything (URL, ref, model, ...), update it by hand:")
-        print("   " + json.dumps(manifest, indent=2).replace("\n", "\n   "))
+    print(f"   already exists, and updating it FAILED ({put_status}): {put_data}")
+    print(f"   The registered {kind} may be out of sync with the manifest "
+          f"below -- update it by hand if this matters for your run:")
+    print("   " + json.dumps(manifest, indent=2).replace("\n", "\n   "))
+    return True
+
+
+def _upsert_agent(name: str, spec: dict) -> bool:
+    """Agents are id-scoped, not name-scoped, for updates -- verified
+    against this instance's own /api/v1/openapi.json after the first
+    version of this script got a live 'Unrecognized key: "name"' 400:
+    PUT /api/v1/agents/{agent_id} takes UpdateAgentRequest, which is
+    strictly {"manifest": ...} (additionalProperties: false -- no "name"
+    key, unlike CreateAgentRequest which requires one), and agent_id is a
+    separate server-generated id, NOT the human-readable name -- the spec
+    literally calls it 'Immutable server-generated agent identifier'. So
+    updating an existing agent means: GET /api/v1/agents, find the entry
+    whose name matches, take ITS id, then PUT to /api/v1/agents/{that id}
+    with just {"manifest": spec}."""
+    print(f"-> registering agent '{name}'")
+    status, data = _post("/api/v1/agents", {"name": name, "manifest": spec})
+    if status and 200 <= status < 300:
+        print(f"   OK ({status})")
         return True
-    else:
-        print(f"   already exists, and updating it FAILED ({put_status}): {put_data}")
-        print(f"   The registered {kind} may be out of sync with the manifest "
-              f"below -- update it by hand if this matters for your run:")
-        print("   " + json.dumps(manifest, indent=2).replace("\n", "\n   "))
+    if not (status == 409 or "already exists" in str(data.get("error", "")).lower()):
+        print(f"   FAILED ({status}): {data}")
+        print("   Fall back to the UI, using:")
+        print("   " + json.dumps(spec, indent=2).replace("\n", "\n   "))
+        return False
+
+    list_status, list_data = _get("/api/v1/agents")
+    agent_id = None
+    if list_status and 200 <= list_status < 300:
+        for item in list_data.get("data", []):
+            if item.get("name") == name:
+                agent_id = item.get("id")
+                break
+    if not agent_id:
+        print(f"   already exists, but couldn't look up its id via GET /api/v1/agents "
+              f"({list_status}) to update it -- update it by hand in Settings -> Agents:")
+        print("   " + json.dumps(spec, indent=2).replace("\n", "\n   "))
         return True
+
+    put_status, put_data = _put(f"/api/v1/agents/{agent_id}", {"manifest": spec})
+    if put_status and 200 <= put_status < 300:
+        print(f"   already existed -- updated to match the current manifest ({put_status})")
+        return True
+    print(f"   already exists, and updating it FAILED ({put_status}): {put_data}")
+    print(f"   The registered agent may be out of sync with the manifest "
+          f"below -- update it by hand if this matters for your run:")
+    print("   " + json.dumps(spec, indent=2).replace("\n", "\n   "))
+    return True
 
 
 def register_mcp_server() -> bool:
@@ -167,8 +232,7 @@ def register_mcp_server() -> bool:
         # No `auth` key: omit entirely for an unauthenticated server. There
         # is no `{"type": "none"}` variant in TrueForge's MCPServerManifest.
     }
-    return _upsert("MCP server", "/api/v1/settings/mcp-servers", MCP_SERVER_NAME,
-                    {"manifest": manifest}, manifest)
+    return _upsert_collection("MCP server", "/api/v1/settings/mcp-servers", MCP_SERVER_NAME, manifest)
 
 
 def register_agent(mcp_server_ready: bool, skill_ready: bool) -> bool:
@@ -221,8 +285,7 @@ def register_agent(mcp_server_ready: bool, skill_ready: bool) -> bool:
             "iteration_limit": 40,
         },
     }
-    return _upsert("agent", "/api/v1/agents", AGENT_NAME,
-                    {"name": AGENT_NAME, "manifest": spec}, spec)
+    return _upsert_agent(AGENT_NAME, spec)
 
 
 def register_skill() -> bool:
@@ -247,8 +310,60 @@ def register_skill() -> bool:
         "description": "SRE operational playbook: triage -> sandbox diagnostic -> "
                         "gated rollback -> verify -> incident report.",
     }
-    return _upsert("skill", "/api/v1/settings/skills", SKILL_NAME,
-                    {"manifest": manifest}, manifest)
+    return _upsert_collection("skill", "/api/v1/settings/skills", SKILL_NAME, manifest)
+
+
+def register_miner_skill() -> bool:
+    """Same git-backed skill registration as register_skill(), for the
+    pattern-miner skill instead of sre-playbook."""
+    if "<you>/<repo>" in GITHUB_REPO:
+        print("-> SKIPPING pattern-miner skill registration: GITHUB_REPO_URL is not set.")
+        print(f"   Add it by hand in Settings -> Skills instead:")
+        print(f"     name: {MINER_SKILL_NAME}  path: skills/{MINER_SKILL_NAME}  ref: {MINER_SKILL_REF}")
+        return False
+
+    manifest = {
+        "type": "git",
+        "name": MINER_SKILL_NAME,
+        "url": GITHUB_REPO,
+        "path": f"skills/{MINER_SKILL_NAME}",
+        "ref": MINER_SKILL_REF,
+        "description": "Periodic mining of known_patterns.json: proposes signature "
+                        "merges, trust-threshold tuning, and suspicious-pattern flags.",
+    }
+    return _upsert_collection("skill", "/api/v1/settings/skills", MINER_SKILL_NAME, manifest)
+
+
+def register_miner_agent(skill_ready: bool) -> bool:
+    """The pattern-miner agent -- no MCP server needed, it only ever reasons
+    over the known_patterns.json snapshot it's handed in its turn input, it
+    never calls a tool. See backend/pattern_insights.py for how its output
+    (a JSON proposal list) gets applied."""
+    if not skill_ready:
+        print(f"-> SKIPPING pattern-miner agent registration: skill "
+              f"'{MINER_SKILL_NAME}' not confirmed registered above.")
+        return False
+
+    if not MINER_MODEL_NAME:
+        print("-> SKIPPING pattern-miner agent registration: no model configured "
+              "(set TRUEFORGE_MODEL or TRUEFORGE_MINER_MODEL).")
+        return False
+
+    spec = {
+        "model": {"name": MINER_MODEL_NAME},
+        "instructions": (
+            "You periodically analyze a snapshot of demo-app's incident pattern "
+            "store and propose merges, trust-threshold changes, and suspicious-"
+            "pattern flags. Follow the pattern-miner skill exactly, including its "
+            "strict JSON-only output format."
+        ),
+        "skills": [{"name": MINER_SKILL_NAME}],
+        "config": {
+            "sandbox": {"enabled": False},  # pure reasoning over the text it's given -- no code execution needed
+            "iteration_limit": 10,
+        },
+    }
+    return _upsert_agent(MINER_AGENT_NAME, spec)
 
 
 if __name__ == "__main__":
@@ -264,12 +379,20 @@ if __name__ == "__main__":
     agent_ok = register_agent(mcp_server_ready=mcp_ok, skill_ready=skill_ok)
 
     print()
-    if mcp_ok and skill_ok and agent_ok:
-        print("Done -- all three registered. Then: ./scripts/run_all.sh "
-              "(or docker compose up, if not already running)")
+    miner_skill_ok = register_miner_skill()
+    print()
+    miner_agent_ok = register_miner_agent(skill_ready=miner_skill_ok)
+
+    print()
+    all_ok = mcp_ok and skill_ok and agent_ok and miner_skill_ok and miner_agent_ok
+    if all_ok:
+        print("Done -- all five registered (MCP server, sre-playbook skill, "
+              "incident-responder agent, pattern-miner skill, pattern-miner agent). "
+              "Then: ./scripts/run_all.sh (or docker compose up, if not already running)")
     else:
         failed = [name for name, ok in
-                  [("MCP server", mcp_ok), ("skill", skill_ok), ("agent", agent_ok)]
+                  [("MCP server", mcp_ok), ("skill", skill_ok), ("agent", agent_ok),
+                   ("pattern-miner skill", miner_skill_ok), ("pattern-miner agent", miner_agent_ok)]
                   if not ok]
         print(f"NOT fully done -- {', '.join(failed)} registration did not succeed. "
               f"Fix the issue(s) above and re-run this script before starting the app.")
