@@ -34,6 +34,19 @@ app = FastAPI(title="incident-responder backend")
 
 _lock = threading.Lock()
 
+# Separate from _lock on purpose: _lock is only ever held briefly for a
+# STATE mutation. Applying a fix against demo-app takes real seconds
+# (the POST itself, then up to ~5s of recovery polling), and the earlier
+# STATE["generation"] check alone only stops a stale worker from
+# corrupting STATE -- it does nothing to stop the ALREADY-DESTRUCTIVE
+# rollback call itself from firing against demo-app for an incident
+# that's no longer the current one. _apply_lock enforces that at most
+# one destructive apply is ever in flight, and that a /reset or a new
+# incident can't start (and can't bump the generation) until any
+# in-flight apply has fully finished -- see _apply_fallback_fix(),
+# reset(), webhook_incident(), and debug_simulate_llm_failure().
+_apply_lock = threading.Lock()
+
 # Separate from STATE/_lock on purpose: STATE["events"] is cleared on every
 # new incident and on /reset, but mining runs independently of the incident
 # lifecycle -- a Pattern Insights panel showing 'no history' every time an
@@ -564,53 +577,73 @@ def _apply_fallback_fix(args: dict, generation: int) -> None:
     mirrors what the LLM path's step 6 (verify recovery) does.
 
     `generation` is captured by the /approve caller at the moment of
-    approval -- same stale-write guard as _run_deterministic_fallback,
-    since apply_fix() and the recovery poll below both block for real
-    time a /reset could happen during. (Qodo, bug #3.)"""
+    approval. Holds _apply_lock for the whole operation -- see its own
+    comment -- so this is never running concurrently with another apply
+    OR with a reset/new-incident transition, and re-checks the
+    generation immediately after acquiring that lock, BEFORE calling
+    apply_fix(), not only after: the STATE-write guards below stop a
+    stale worker from corrupting STATE, but only this upfront check
+    stops it from firing the actual destructive rollback in the first
+    place for an incident that's already been superseded."""
     global _seq
-    try:
-        result = fallback.apply_fix(args["dsn"], args["reason"])
-    except Exception as exc:  # noqa: BLE001
+    with _apply_lock:
         with _lock:
             if STATE["generation"] != generation:
-                return
+                return  # superseded before we even acquired the apply lock
+        try:
+            result = fallback.apply_fix(args["dsn"], args["reason"])
+        except Exception as exc:  # noqa: BLE001
+            with _lock:
+                if STATE["generation"] != generation:
+                    return
+                _seq += 1
+                STATE["events"].append({
+                    "seq": _seq, "at": _now(), "type": "fallback.apply_failed",
+                    "data": {"type": "fallback.apply_failed", "error": f"{type(exc).__name__}: {exc}"},
+                })
+                STATE["status"] = "error"
+                STATE["stage"] = STAGE_LABELS["error"]
+                STATE["error"] = f"Deterministic fallback's fix attempt failed: {type(exc).__name__}: {exc}"
+            return
+
+        healthy = False
+        for _ in range(5):
+            time.sleep(1)
+            try:
+                status = fallback._check_db_health()
+                healthy = bool(status.get("healthy"))
+                if healthy:
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+
+        with _lock:
+            if STATE["generation"] != generation:
+                return  # a newer incident/reset happened during apply/poll -- discard
             _seq += 1
             STATE["events"].append({
-                "seq": _seq, "at": _now(), "type": "fallback.apply_failed",
-                "data": {"type": "fallback.apply_failed", "error": f"{type(exc).__name__}: {exc}"},
+                "seq": _seq, "at": _now(), "type": "fallback.apply_result",
+                "data": {"type": "fallback.apply_result", "result": result, "healthy_after": healthy},
             })
-            STATE["status"] = "error"
-            STATE["stage"] = STAGE_LABELS["error"]
-            STATE["error"] = f"Deterministic fallback's fix attempt failed: {type(exc).__name__}: {exc}"
-        return
-
-    healthy = False
-    for _ in range(5):
-        time.sleep(1)
-        try:
-            status = fallback._check_db_health()
-            healthy = bool(status.get("healthy"))
-            if healthy:
-                break
-        except Exception:  # noqa: BLE001
-            pass
-
-    with _lock:
-        if STATE["generation"] != generation:
-            return  # a newer incident/reset happened during apply/poll -- discard
-        _seq += 1
-        STATE["events"].append({
-            "seq": _seq, "at": _now(), "type": "fallback.apply_result",
-            "data": {"type": "fallback.apply_result", "result": result, "healthy_after": healthy},
-        })
-        STATE["status"] = "resolved" if healthy else "error"
-        STATE["stage"] = STAGE_LABELS["resolved" if healthy else "error"]
-        if not healthy:
-            STATE["error"] = "Applied the rollback but demo-app still doesn't report healthy after ~5s."
+            STATE["status"] = "resolved" if healthy else "error"
+            STATE["stage"] = STAGE_LABELS["resolved" if healthy else "error"]
+            if not healthy:
+                STATE["error"] = "Applied the rollback but demo-app still doesn't report healthy after ~5s."
 
 
-def _run_pre_check() -> bool:
-    """Runs BEFORE any LLM call -- deterministic-first architecture,
+def _run_pre_check(generation: int) -> bool:
+    """`generation` is STATE["generation"] as of the moment webhook_incident()
+    launched this pre-check (captured right after its own reset). diagnose()
+    below makes blocking HTTP calls with no lock held across them, so a
+    /reset or a brand new incident can legitimately happen while this is in
+    flight -- every write below checks the generation is still current
+    first, so a superseded pre-check can't hand a stale pending_approval or
+    final_report to whatever incident (or idle state) is actually current
+    now. The caller (webhook_incident()) ALSO re-checks freshness itself
+    after this returns, independent of what this returns, so a superseded
+    request never goes on to open a TrueForge session either.
+
+    Runs BEFORE any LLM call -- deterministic-first architecture,
     gated by actual TRUSTED history, not just diagnosability. Tries the
     exact same diagnosis the post-failure fallback uses; if it's
     confident AND known_patterns considers this exact signature trusted
@@ -629,6 +662,8 @@ def _run_pre_check() -> bool:
     it should fall through to a real LLM-driven turn."""
     global _seq
     with _lock:
+        if STATE["generation"] != generation:
+            return False  # superseded before this even started
         _seq += 1
         STATE["events"].append({
             "seq": _seq, "at": _now(), "type": "precheck.started",
@@ -639,6 +674,8 @@ def _run_pre_check() -> bool:
 
     if not result.get("root_cause"):
         with _lock:
+            if STATE["generation"] != generation:
+                return False  # a newer incident/reset happened while diagnosing -- discard
             _seq += 1
             STATE["events"].append({
                 "seq": _seq, "at": _now(), "type": "precheck.inconclusive",
@@ -658,6 +695,8 @@ def _run_pre_check() -> bool:
         # actually reviews it, moving this signature closer to (or, on
         # a deny, back away from) being trusted next time.
         with _lock:
+            if STATE["generation"] != generation:
+                return False  # superseded while diagnosing/matching -- discard
             _seq += 1
             STATE["events"].append({
                 "seq": _seq, "at": _now(), "type": "precheck.escalating",
@@ -669,6 +708,8 @@ def _run_pre_check() -> bool:
         return False
 
     with _lock:
+        if STATE["generation"] != generation:
+            return False  # superseded between matching and resolving -- discard
         _seq += 1
         STATE["events"].append({
             "seq": _seq, "at": _now(), "type": "precheck.diagnosis",
@@ -896,12 +937,23 @@ def webhook_incident(payload: IncidentWebhook):
         global _seq
         _seq = 0
 
+    generation = STATE["generation"]
+
     # Deterministic-first: try the free, instant check before ever
     # spending an LLM call. Only escalate to a real TrueForge/LLM-driven
     # investigation if this can't confidently diagnose it -- or if the
     # caller explicitly asked to bypass it (force_llm, test-only).
-    if not payload.force_llm and _run_pre_check():
+    if not payload.force_llm and _run_pre_check(generation):
         return {"accepted": True, "session_id": None, "via": "deterministic_precheck"}
+
+    with _lock:
+        if STATE["generation"] != generation:
+            # A /reset or a newer incident superseded this request while the
+            # pre-check was diagnosing -- _run_pre_check() already discarded
+            # any writes for it, but this request must ALSO stop here rather
+            # than opening a TrueForge session and investigating a payload
+            # that's no longer what STATE reflects.
+            return {"accepted": False, "reason": "superseded by a newer incident or reset while pre-checking"}
 
     try:
         session = tf.create_session(AGENT_NAME)
