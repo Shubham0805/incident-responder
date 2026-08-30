@@ -263,13 +263,23 @@ def _update_stage() -> None:
     STATE["stage"] = STAGE_LABELS["investigating"]
 
 
-def _record_event(evt: dict) -> None:
+def _record_event(evt: dict, generation: int) -> None:
     """Called from the SSE-consuming thread for every event -- append to the
-    transparent log, index it, and react to the ones that matter."""
+    transparent log, index it, and react to the ones that matter.
+
+    `generation` is STATE["generation"] as of the moment the _run_turn()
+    that owns this stream was launched (see its callers). A stream worker
+    has no way to know a /reset or a brand new incident happened while it
+    was blocked reading SSE -- without this guard, an old worker's event
+    callbacks (and its exception handling -- see _run_turn()) would keep
+    mutating STATE right through a newer incident. Bail out before
+    touching anything if this stream has been superseded."""
     global _seq
     run_fallback = False
     fallback_generation = None
     with _lock:
+        if STATE["generation"] != generation:
+            return  # stale stream worker from a superseded incident -- ignore entirely
         _seq += 1
         entry = {"seq": _seq, "at": _now(), "type": evt.get("type"), "data": evt}
         STATE["events"].append(entry)
@@ -345,7 +355,7 @@ def _record_event(evt: dict) -> None:
                 # actually diagnose it deterministically. Runs after the lock
                 # is released below, since it makes blocking HTTP calls.
                 run_fallback = True
-                fallback_generation = STATE["generation"]
+                fallback_generation = generation
             # else: some other in-between status -- leave it as-is rather
             # than guessing
 
@@ -439,13 +449,24 @@ def _extract_final_report() -> str | None:
     return None
 
 
-def _run_turn(session_id: str, input_items: list[dict]) -> None:
+def _run_turn(session_id: str, input_items: list[dict], generation: int) -> None:
+    """`generation` is STATE["generation"] as of the moment this turn was
+    launched (captured by the caller under its own lock -- see
+    webhook_incident()/approve()/deny()). Threaded straight through to
+    every _record_event() callback so a stale stream from a superseded
+    incident can't mutate the current one, and checked again -- using
+    this SAME captured value, not a fresh STATE["generation"] read -- if
+    the stream itself raises, since a fresh read after the fact could
+    already reflect a newer incident that happens to share this thread's
+    old 'investigating' status by coincidence."""
     try:
-        tf.stream_turn(session_id, input_items, _record_event)
+        tf.stream_turn(session_id, input_items, lambda evt: _record_event(evt, generation))
     except Exception as exc:  # noqa: BLE001 -- surface any harness/network error to the dashboard
         run_fallback = False
         fallback_generation = None
         with _lock:
+            if STATE["generation"] != generation:
+                return  # this turn belongs to a superseded incident -- ignore entirely
             STATE["error"] = f"{type(exc).__name__}: {exc}"
             if STATE["status"] == "investigating":
                 # Same resilience net as the turn.done/"investigating" branch
@@ -461,7 +482,7 @@ def _run_turn(session_id: str, input_items: list[dict]) -> None:
                 # re-diagnosis shouldn't barge into.
                 STATE["status"] = "error"
                 run_fallback = True
-                fallback_generation = STATE["generation"]
+                fallback_generation = generation
             _update_stage()
         if run_fallback:
             threading.Thread(target=_run_deterministic_fallback, args=(fallback_generation,), daemon=True).start()
@@ -847,8 +868,9 @@ def debug_simulate_llm_failure():
         _delta_buffers.clear()
         global _seq
         _seq = 0
-    _record_event({"type": "turn.created", "id": "debug-turn"})
-    _record_event({"type": "turn.done", "id": "debug-turn-done", "state": {"status": "error"}})
+    debug_generation = STATE["generation"]
+    _record_event({"type": "turn.created", "id": "debug-turn"}, debug_generation)
+    _record_event({"type": "turn.done", "id": "debug-turn-done", "state": {"status": "error"}}, debug_generation)
     return {"ok": True, "note": "simulated LLM failure injected -- watch the dashboard, zero API calls made"}
 
 
@@ -902,6 +924,7 @@ def webhook_incident(payload: IncidentWebhook):
         raise HTTPException(502, STATE["error"])
     with _lock:
         STATE["session_id"] = session_id
+        generation = STATE["generation"]
 
     intro = (
         f"ALERT: {payload.alert} fired for demo-app. "
@@ -910,7 +933,7 @@ def webhook_incident(payload: IncidentWebhook):
         f"and drive this to resolution."
     )
     threading.Thread(
-        target=_run_turn, args=(session_id, [tf.user_message(intro)]), daemon=True
+        target=_run_turn, args=(session_id, [tf.user_message(intro)], generation), daemon=True
     ).start()
     return {"accepted": True, "session_id": session_id}
 
@@ -999,8 +1022,9 @@ def approve(decision: Decision):
         STATE["status"] = "remediating"
         STATE["stage"] = STAGE_LABELS["remediating"]
         STATE["error"] = None  # clear any stale earlier error now that this step is actually proceeding
+        generation = STATE["generation"]
 
-    threading.Thread(target=_run_turn, args=(session_id, [item]), daemon=True).start()
+    threading.Thread(target=_run_turn, args=(session_id, [item], generation), daemon=True).start()
     return {"ok": True}
 
 
@@ -1069,8 +1093,9 @@ def deny(decision: Decision):
         STATE["status"] = "remediation_denied"
         STATE["stage"] = STAGE_LABELS["remediation_denied"]
         STATE["error"] = None  # clear any stale earlier error now that this step is actually proceeding
+        generation = STATE["generation"]
 
-    threading.Thread(target=_run_turn, args=(session_id, [item]), daemon=True).start()
+    threading.Thread(target=_run_turn, args=(session_id, [item], generation), daemon=True).start()
     return {"ok": True}
 
 
