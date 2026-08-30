@@ -1,13 +1,37 @@
-# Incident Responder — an SRE agent on TrueForge
+# 🐿️ Groundhog — stop reliving the same incident
 
 Built for [The Agent Harness Hackathon](https://www.wemakedevs.org/hackathons/trueforge) (WeMakeDevs × TrueFoundry × Qodo, Aug 24–30 2026).
 
-An autonomous on-call agent that watches a (simulated) production service, triages a
-real incident by reading logs and running its own diagnostic script in an isolated
-sandbox, proposes a rollback, **stops and waits for a human to approve it**, then
-executes the fix and verifies recovery — all visible live in a transparent
-Streamlit "mission control" dashboard built for judges to watch, not just a demo
-narrator to describe.
+## The problem
+
+Most incidents aren't new — they're repeats. DORA's 2024–25 State of DevOps report
+puts low-performing teams' Change Failure Rate at ~64%: most outages trace straight
+back to a recent deploy or config change, not a novel bug, and configuration errors
+were the recurring root cause behind 2024's highest-profile outages (CrowdStrike,
+Azure, Salesforce, Google Cloud Pub/Sub — ThousandEyes 2024 Internet Report). Meanwhile
+on-call engineers are drowning in the fallout: operational toil rose to 30% of their
+time in 2025, the first increase in five years (Catchpoint SRE Report 2025), up to 67%
+of daily alerts may go ignored (incident.io 2025), and 73% of organizations report
+outages linked to alerts that were suppressed or ignored (Splunk State of
+Observability 2025).
+
+The part nobody automates: when the *exact same* incident recurs — the same config
+field silently drifting on a bad deploy — a human re-investigates it from scratch
+every time, because nothing remembers what was decided last time it happened.
+
+## What Groundhog does
+
+Groundhog is an on-call teammate that investigates config-drift incidents the way a
+senior SRE would — reads the logs, runs its own diagnostic script in an isolated
+sandbox, and proposes an exact rollback — and **never applies a fix without a human
+approving it, every single time.** But it keeps a small, bounded memory of every
+approve/deny decision, distilled by incident signature rather than stored as raw
+incident logs. The first time a fault shows up, a human reviews it in full. The tenth
+time the *exact same* fault recurs, the human sees "you've approved this exact fix 4
+times before, denied it 0 times" right on the approval card — same gate, same
+human-in-the-loop every time, but seconds of context instead of a full
+re-investigation. All of it visible live in a transparent Streamlit "mission control"
+dashboard built for judges to watch, not just a demo narrator to describe.
 
 It runs on the real [TrueForge](https://github.com/truefoundry/trueforge) agent
 harness: real MCP tools, a real Daytona sandbox, and TrueForge's own
@@ -17,8 +41,8 @@ harness: real MCP tools, a real Daytona sandbox, and TrueForge's own
 
 | Judging category | How this project addresses it |
 |---|---|
-| Potential Impact | A real on-call pain point: triage + guarded remediation, not just a chatbot. |
-| Creativity & Originality | The whole incident is choreographed end-to-end (chaos → telemetry → agent → human gate → verified fix), not a single prompt. |
+| Potential Impact | Targets a specific, well-documented on-call pain point (repeat incidents re-investigated from scratch every time — see "The problem" above), not a generic chatbot demo. |
+| Creativity & Originality | The bounded, signature-keyed "known patterns" memory is the actual novel piece — institutional memory for on-call approve/deny decisions, gated the same way every time, never auto-bypassing a human. The whole incident is also choreographed end-to-end (chaos → telemetry → agent → human gate → verified fix), not a single prompt. |
 | Technical Excellence | Real webhook → real TrueForge session/turn → real sandbox script → real gated MCP tool → real resume-on-approval. |
 | Use of Sponsor Tools | Every TrueForge primitive in the brief is used on purpose: MCP servers, sandbox, skills, `require_approval_for_tools`, SSE event stream. Qodo reviews the PR that ships this code (see below). |
 | Control & Safety | The one destructive action (`apply_system_change`) is MCP-tagged `@destructive` and explicitly gated — the harness *cannot* run it without a human clicking Approve. The agent only ever touches the sandboxed demo app, never anything real. |
