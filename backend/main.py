@@ -767,9 +767,25 @@ def _build_mining_prompt(patterns: list[dict]) -> str:
         "Here is the current known_patterns.json snapshot -- each entry has "
         "signature, variants, approved_count, denied_count, "
         "consecutive_approvals, trust_threshold, suspicious, "
-        "root_cause_summary, first_seen, last_seen. Follow the pattern-miner "
-        "skill and respond with only the JSON proposal array.\n\n"
+        "root_cause_summary, first_seen, last_seen.\n\n"
         + json.dumps(patterns, indent=2)
+        + "\n\nDo NOT return a rewritten copy of the snapshot above, and do not "
+        "include a signature, variants, approved_count, or any other "
+        "known_patterns.json field at the top level of an item -- that is the "
+        "INPUT shape, not your OUTPUT shape. Your output is a separate, much "
+        "smaller JSON array of PROPOSALS, one object per change you want to "
+        "make, in EXACTLY this shape and nothing else (empty array [] if you "
+        "have nothing to propose):\n"
+        '[{"type": "merge" | "threshold" | "flag", "confidence": "high" | "medium" | "low", '
+        '"reasoning": "<one or two sentences>", "payload": { ... }}]\n\n'
+        "Example of a correct merge proposal (payload shape varies by type -- "
+        "see the pattern-miner skill for threshold/flag payloads):\n"
+        '[{"type": "merge", "confidence": "high", "reasoning": "Both entries are the same DSN typo.", '
+        '"payload": {"signature_a": "<exact signature string copied from an entry above>", '
+        '"signature_b": "<exact signature string copied from an entry above>", '
+        '"canonical": "<must equal signature_a or signature_b>"}}]\n\n'
+        "Respond with ONLY that JSON array -- no markdown code fences, no prose "
+        "before or after it."
     )
 
 
@@ -820,6 +836,21 @@ def _run_pattern_mining() -> None:
                 report_text = _extract_message_text(evt.get("content"))
                 if report_text:
                     break
+
+        if not report_text:
+            # Live-verified (Aug 31): the pattern-miner agent's model.message
+            # lands as an empty placeholder right at turn start -- unlike the
+            # on-call path, it never carries the real text. The actual
+            # response streams in afterward as a burst of model.message.delta
+            # events instead (confirmed via debug_event_types/
+            # debug_report_text_preview on a live run). Fall back to
+            # accumulating those chunks in event order, same extraction
+            # (_extract_delta_text) the on-call path's _delta_buffers uses.
+            delta_chunks = [
+                _extract_delta_text(evt) for evt in local_events
+                if evt.get("type") == "model.message.delta"
+            ]
+            report_text = "".join(c for c in delta_chunks if c).strip() or None
 
         proposals = _parse_mining_output(report_text or "")
         added = pattern_insights.submit_proposals(proposals)
