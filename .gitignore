@@ -9,3 +9,10 @@ node_modules/
 .streamlit/secrets.toml
 demo-app/state/
 openapi.json
+
+# Runtime demo state -- generated locally by backend/main.py while the app
+# runs (incident approvals/denials, mining-agent proposals, merge groups),
+# not something that should ship in the repo or get committed by accident.
+backend/known_patterns.json
+backend/pattern_insights.json
+backend/pattern_groups.json
